@@ -9,8 +9,9 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 from . import skill_loader as SK
+from .config import MAX_DOC_CHARS, MAX_SHEET_ROWS
 from .schema import CRITICAL, TABLE_COLS, effective, is_filled, label, rows
-from .words import fmt_amount, fmt_date, parse_date, to_float, to_words
+from .words import fmt_amount, fmt_date, parse_date, to_float, to_words, words_key
 
 
 @dataclass
@@ -252,10 +253,11 @@ def validate(kind: str, case: dict, docs=None) -> Report:
                          "agreement — this app does not read clause numbering as authoritative.")
 
     # ---- 5. figures and words must agree ---------------------------------
+    # Compared on the number words alone: a missing "Rupees" prefix or "Only"
+    # is a formatting difference that house_words() fixes at draft time, not a
+    # mismatch between the figure and the words.
     if amt and str(case.get("amount_words", "")).strip():
-        import re as _re
-        norm = lambda s: _re.sub(r"[^a-z]", "", str(s).lower())
-        if norm(case["amount_words"]) != norm(to_words(amt)):
+        if words_key(case["amount_words"]) != words_key(to_words(amt)):
             r.blockers.append(f"The amount in words does not match the figure. INR {fmt_amount(amt)} reads "
                               f"as “{to_words(amt)}”, but the notice would say “{case['amount_words']}”.")
 
@@ -271,6 +273,24 @@ def validate(kind: str, case: dict, docs=None) -> Report:
     }.get(kind, ["copy of the executed agreement", "copies of the correspondence relied upon"])
     for d in docs:
         r.annexures.append(f"{d.name}" + ("" if d.kind in ("tables", "text") else " (attached, not read)"))
+
+    # ---- 7. truncated sources -------------------------------------------
+    # A sheet longer than MAX_SHEET_ROWS is cut before the model ever sees it.
+    # Any amount derived from it is then derived from part of the file, and no
+    # arithmetic check above can catch that — the sums tie to each other while
+    # all of them omit the same rows. So it stops the draft rather than warns.
+    for d in docs:
+        dropped = getattr(d, "dropped_rows", 0)
+        if dropped:
+            r.blockers.append(
+                f"{d.name}: {dropped} row(s) were not read — the file is longer than the "
+                f"{MAX_SHEET_ROWS}-row limit. Any amount taken from it would be computed from "
+                f"part of the file. Raise MAX_SHEET_ROWS, or attach a filtered extract "
+                f"containing only this counterparty's rows."
+            )
+        elif getattr(d, "dropped_chars", 0):
+            add_flag("warn", f"{d.name}: the end of this document was not read (over the "
+                             f"{MAX_DOC_CHARS}-character limit). Check nothing relied on sits past the cut.")
     return r
 
 
