@@ -284,8 +284,19 @@ def deterministic(kind: str, case: dict, docs: list[Doc]) -> Found:
                 if cols["amt"] >= 0:
                     total = sum(to_float(r[cols["amt"]]) or 0 for r in body if cols["amt"] < len(r))
                     if total:
+                        # Name the column. "Outstanding", "Balance", "Debit" and "Net" are
+                        # different figures in a real ledger and the sniffer cannot tell
+                        # which one was meant — so the choice is stated, not hidden.
+                        col_name = str(header[cols["amt"]]).strip() if cols["amt"] < len(header) else ""
+                        col_name = col_name or f"column {cols['amt'] + 1}"
                         out.values["amount"] = round(total, 2)
-                        out.evidence["amount"] = f"{d.name}: sum of {len(body)} rows"
+                        out.evidence["amount"] = (f"{d.name}, sheet “{t['sheet']}”: sum of {len(body)} rows "
+                                                  f"in column “{col_name}”")
+                        out.notes.append(
+                            f"{d.name}: no model key configured, so the amount column was chosen by "
+                            f"keyword. It summed “{col_name}”. Confirm that is the figure you want — "
+                            f"outstanding, balance, debit and net are not the same thing."
+                        )
                 pre = "\n".join(" ".join(str(c) for c in r) for r in rows[:hi])
                 m = re.search(r"as\s*on\s*:?\s*([0-9][0-9.\-/]{6,12})", pre, re.I)
                 if m and iso(m[1]):
