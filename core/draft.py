@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from . import skill_loader as SK
 from .config import blank
 from .schema import label, rows
-from .words import fmt_amount, fmt_date, inr, to_float, to_words
+from .words import fmt_amount, fmt_date, house_words, inr, to_float, to_words
 
 MODES_DEFAULT = "BY SPEED POST"
 
@@ -50,7 +50,7 @@ def M(case, key, lbl=None):
 def W(case, key="amount", lbl="amount in words"):
     typed = str(case.get("amount_words") or "").strip()
     if typed:
-        return typed
+        return house_words(typed)      # 'Rupees ... Only', however it was typed
     v = to_float(case.get(key))
     return to_words(v) if v is not None else blank(lbl)
 
