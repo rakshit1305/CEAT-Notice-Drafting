@@ -52,6 +52,40 @@ def to_words(value) -> str:
     return s + " Only"
 
 
+_FILLER = r"\b(rupees|rupee|rs|inr|only|and)\b"
+
+
+def words_key(value) -> str:
+    """A comparison key for an amount in words.
+
+    Keeps the number words, drops the currency prefix, the trailing "Only" and
+    any "and" — so "Five Lakh Seventy Six Thousand Only" and "Rupees Five Lakh
+    Seventy Six Thousand Only" compare equal, while a genuine difference in the
+    figure still does not. "Paise" is deliberately kept.
+    """
+    t = re.sub(r"[^a-z]", " ", str(value).lower())
+    t = re.sub(_FILLER, " ", t)
+    return re.sub(r"\s+", "", t)
+
+
+def house_words(value) -> str:
+    """Put a typed amount-in-words into CEAT house form: 'Rupees ... Only'.
+
+    draft.py prints the typed string verbatim, so without this a notice could
+    read "Five Lakh Seventy Six Thousand Only" with no currency named.
+    """
+    t = " ".join(str(value or "").split()).strip().rstrip(".")
+    if not t:
+        return ""
+    if re.match(r"^(rupees|rupee|rs|inr)\b", t, re.I):
+        t = re.sub(r"^(rupees|rupee|rs|inr)\b\.?\s*", "Rupees ", t, flags=re.I)
+    else:
+        t = "Rupees " + t
+    if not re.search(r"\bonly$", t, re.I):
+        t = t + " Only"
+    return t
+
+
 def to_float(value):
     if value is None:
         return None
