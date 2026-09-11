@@ -1,0 +1,9 @@
+streamlit>=1.48          # container keys -> st-key-* hooks used by the stylesheet
+openai>=1.55.3           # <1.55.3 passes proxies= to httpx, which httpx 0.28 removed
+pandas>=2.1
+openpyxl>=3.1           # .xlsx
+xlrd>=2.0               # legacy .xls
+pdfplumber>=0.11        # PDF text + tables
+python-docx>=1.1        # read .docx, write the notice
+python-dotenv>=1.0
+httpx>=0.27              # pinned together with openai: they must agree

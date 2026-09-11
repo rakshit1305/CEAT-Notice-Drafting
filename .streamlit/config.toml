@@ -1,0 +1,16 @@
+# Pinned so the console looks identical on every machine. Without this,
+# Streamlit follows each viewer's OS light/dark setting and the same app
+# renders differently on two desks.
+[theme]
+base = "dark"
+primaryColor = "#D8B14A"
+backgroundColor = "#080C18"
+secondaryBackgroundColor = "#111A31"
+textColor = "#E9EDF8"
+font = "sans serif"
+
+[server]
+maxUploadSize = 30
+
+[browser]
+gatherUsageStats = false
