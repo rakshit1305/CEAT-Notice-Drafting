@@ -819,6 +819,14 @@ with right:
             st.caption("Wording comes from CEAT's approved templates. Verify provisions against "
                        "India Code or India Kanoon — this app does not fetch live statutes.")
 
+            if rep.skill_checklist:
+                st.divider()
+                st.markdown("**Mandatory validation checklist (verbatim from the skill)**")
+                st.caption("Unlike the checks above, this list is read live from the reference "
+                           "file — it always matches SKILL.md, with no code change needed.")
+                for item in rep.skill_checklist:
+                    st.markdown(f"- {_h.escape(item)}", unsafe_allow_html=True)
+
     # ---- 4. everything held -----------------------------------------------
     with tabs[3]:
         st.caption("Every field this notice can carry, and what the console holds right now. "
