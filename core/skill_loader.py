@@ -166,7 +166,13 @@ def notice_ref(kind: str) -> NoticeRef:
     m = re.search(r"```\s*\n(.*?)\n```", tpl, re.S)
     ref.template = m.group(1) if m else tpl
 
-    chk = section("Mandatory checklist") or section("Checklist")
+    # NOTE: the three approved notice types (s138, recovery, consumer) title
+    # this section "Mandatory validation checklist", while the non-standard
+    # types title it "Mandatory checklist". Both must be tried, or the
+    # approved types silently return an empty checklist.
+    chk = (section("Mandatory validation checklist")
+           or section("Mandatory checklist")
+           or section("Checklist"))
     ref.checklist = [re.sub(r"\s+", " ", l.lstrip("-*[ ]x ").strip())
                      for l in chk.splitlines() if l.strip().startswith(("-", "*"))]
     return ref
