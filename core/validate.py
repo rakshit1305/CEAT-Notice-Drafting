@@ -27,6 +27,7 @@ class Report:
     checks: list = field(default_factory=list)
     open_items: list = field(default_factory=list) # render as [● ...]
     annexures: list = field(default_factory=list)
+    skill_checklist: list = field(default_factory=list)  # verbatim from SKILL.md/references
 
     @property
     def ok(self) -> bool:
@@ -100,6 +101,13 @@ def validate(kind: str, case: dict, docs=None) -> Report:
                          "confined to the current instrument.")
     add_flag("info", "Statutory provisions come from CEAT's approved wording. Verify each against "
                      "India Code or India Kanoon before issue; this app does not fetch live statutes.")
+
+    # ---- 3a. verbatim checklist from the skill itself ---------------------
+    # The pass/fail checks below are hand-coded per notice type and can drift
+    # from SKILL.md over time. This surfaces the skill's own checklist text
+    # unchanged, so an edit to the reference file is visible in the app without
+    # any code change, and nothing the skill asks for is silently dropped.
+    r.skill_checklist = ref.checklist
 
     # ---- 4. arithmetic ---------------------------------------------------
     amt = to_float(case.get("amount"))
