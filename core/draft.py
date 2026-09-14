@@ -86,6 +86,44 @@ def noticee_block(case) -> str:
     return "\n".join(lines)
 
 
+def _join(xs: list[str]) -> str:
+    xs = [x for x in xs if x]
+    if len(xs) <= 1:
+        return xs[0] if xs else ""
+    return ", ".join(xs[:-1]) + " and " + xs[-1]
+
+
+def _dir_phrase(dirs: list[str]) -> str:
+    """Noticee numbering that follows the actual count of directors, so two
+    directors do not silently render as the hard-coded 'Nos. 2 and 3'."""
+    if not dirs:
+        return blank("director names")
+    nos = _join([str(i) for i in range(2, 2 + len(dirs))])
+    word = "Noticee Nos." if len(dirs) > 1 else "Noticee No."
+    return f"{word} {nos}, {_join(dirs)}"
+
+
+def _discharge(inv, chq) -> str:
+    """A cheque for less than the invoiced total is a PART discharge. Saying
+    'in discharge' of a liability larger than the cheque misdescribes the debt."""
+    it = sum(to_float(r.get("amt")) or 0 for r in (inv or []) if isinstance(r, dict))
+    ct = sum(to_float(c.get("amt")) or 0 for c in (chq or []) if isinstance(c, dict))
+    return "in part discharge" if (it and ct and ct < it - 0.5) else "in discharge"
+
+
+def _presented(case) -> str:
+    d = fmt_date(case.get("presented_date"))
+    return f" on {d}" if d else " " + blank("date of presentation")
+
+
+def _drawer_phrase(case) -> str:
+    """Who signed the cheque — material where the drawer is a company."""
+    if not str(case.get("noticee_type", "")).startswith("Company"):
+        return ""
+    return (", issued by Noticee No. 1 under the signature of its authorised "
+            "signatory/director")
+
+
 def you(case) -> str:
     return ("you Noticees, jointly and severally,"
             if str(case.get("noticee_type", "")).startswith("Company") else "you")
@@ -128,8 +166,9 @@ def build(kind: str, case: dict) -> tuple[str, list[Block]]:
             dirs = [d.get("name", "") for d in rows(case, "directors") if d.get("name")]
             li.append(f"That you Noticee No. 1, {V(case,'noticee_name')}, are a company registered in India "
                       f"engaged in {V(case,'business','nature of business')}; and "
-                      f"{'Noticee Nos. 2 and 3, ' + ' and '.join(dirs) if dirs else blank('director names')}, "
-                      "are its directors responsible for its management and day-to-day operations.")
+                      f"{_dir_phrase(dirs)}, "
+                      "are its directors responsible for its management and day-to-day operations, "
+                      "and are liable under Section 141 of the Negotiable Instruments Act, 1881.")
         else:
             li.append("That you are the sole proprietor and the person in control and management of the "
                       f"proprietorship concern {V(case,'firm_name','firm name')}, having your office and "
@@ -151,22 +190,24 @@ def build(kind: str, case: dict) -> tuple[str, list[Block]]:
             li.append("That the Company supplied Goods vide invoices received by you without complaint, "
                       "against which you are liable to make payment: " + blank("invoice particulars"))
         chq = rows(case, "cheques")
+        disc = _discharge(inv, chq)
         if len(chq) > 1:
-            li.append(("That in discharge of your admitted liability you issued the following cheques:",
+            li.append((f"That {disc} of your admitted liability you issued the following cheques:",
                        dict(head=["Cheque No.", "Cheque Date", "Amount (INR)", "Drawn on"],
                             rows=[[c.get("no", "—"), fmt_date(c.get("date")) or "—",
                                    fmt_amount(c.get("amt")) or "—", c.get("bank", "—")] for c in chq])))
         else:
             c = chq[0] if chq else {}
-            li.append("That in discharge of your admitted liability you issued cheque no. "
+            li.append(f"That {disc} of your admitted liability you issued cheque no. "
                       f"{c.get('no') or blank('cheque no.')} dated "
                       f"{fmt_date(c.get('date')) or blank('cheque date')} for INR "
                       f"{fmt_amount(c.get('amt')) or blank('cheque amount')}/- drawn on "
-                      f"{c.get('bank') or blank('drawn-on bank')}.")
+                      f"{c.get('bank') or blank('drawn-on bank')}"
+                      f"{_drawer_phrase(case)}.")
         facts, uniform = chq_facts(case, chq)
         if len(facts) > 1 and not uniform:
-            li.append(("That the aforesaid cheques were presented for clearance and, to our shock, "
-                       "were returned unpaid by the drawee bank, as follows:",
+            li.append((f"That the aforesaid cheques were presented for clearance{_presented(case)} "
+                       "and, to our shock, were returned unpaid by the drawee bank, as follows:",
                        dict(head=["Cheque No.", "Returned unpaid on", "Reason", "Bank memo dated"],
                             rows=[[n or "—",
                                    fmt_date(d) or blank("date of dishonour"),
@@ -180,16 +221,17 @@ def build(kind: str, case: dict) -> tuple[str, list[Block]]:
                 d0 = str(case.get("dishonour_date", "")).strip()
                 r0 = str(case.get("dishonour_reason", "")).strip()
                 m0 = str(case.get("memo_date", "")).strip()
-            plural = "cheques were" if len(facts) > 1 else "cheque(s) was/were"
-            li.append(f"That the aforesaid {plural} presented for clearance and, to our shock, "
-                      f"returned unpaid on {fmt_date(d0) or blank('date of dishonour')} for the reason "
+            plural = "cheques were" if len(facts) > 1 else "cheque was"
+            li.append(f"That the aforesaid {plural} presented for clearance{_presented(case)} "
+                      f"and, to our shock, returned unpaid on "
+                      f"{fmt_date(d0) or blank('date of dishonour')} for the reason "
                       f"“{r0 or blank('reason on memo')}” vide bank memo dated "
                       f"{fmt_date(m0) or blank('bank memo date')}.")
         if str(case.get("part_payment", "")).strip():
             li.append(str(case["part_payment"]).strip())
         many = len(chq) > 1
-        cs = "cheques" if many else "cheque(s)"
-        it = "they" if many else "it/they"
+        cs = "cheques" if many else "cheque"
+        it = "they" if many else "it"
         li.append("That despite our repeated efforts to contact you for payment of the balance amount "
                   f"against the dishonoured {cs}, you have failed and neglected to pay, demonstrating "
                   "your disregard for the consequences of non-payment.")
