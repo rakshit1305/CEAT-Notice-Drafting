@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from . import skill_loader as SK
 from .config import llm_ready, llm_settings
 from .extract import Doc
+from .freetext import _cheques, _directors, _invoices, _noticee_type
 from .schema import LABELS, TABLE_COLS, label
 from .words import find_amounts, find_dates, iso, to_float
 
@@ -311,19 +312,42 @@ def deterministic(kind: str, case: dict, docs: list[Doc]) -> Found:
         elif d.kind == "text":
             t = d.text
             dts, amts = find_dates(t), find_amounts(t)
-            chq = re.search(r"(?:cheque|chq)\s*(?:no\.?|number|#)?\s*[:\-]?\s*(\d{5,10})", t, re.I)
-            inv = re.search(r"(?:invoice|inv|bill)\s*(?:no\.?|number|#)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9/\-]{3,24})", t, re.I)
-            bank = re.search(r"^.*\b[Bb]ank\b.*$", t, re.M)
             clause = re.search(r"clause\s*([0-9][0-9.()a-z]*)", t, re.I)
-            if chq:
-                out.values["cheques"] = [dict(no=chq[1], date=dts[0] if dts else "",
-                                              amt=str(amts[0]) if amts else "",
-                                              bank=(bank[0].strip()[:110] if bank else ""))]
+
+            # Cheques: the same cue-anchored reader the typed answers use, so a
+            # pasted sheet and a typed answer produce identical rows. The old
+            # code took the first date and the first amount anywhere in the
+            # file and pasted the whole line containing "Bank" into the bank
+            # field, truncated at 110 characters.
+            chqs = _cheques(t)
+            if chqs:
+                out.values["cheques"] = chqs
                 out.evidence["cheques"] = d.name
-            if inv and kind != "recovery":
-                out.values.setdefault("invoices", [dict(no=inv[1], date=dts[0] if dts else "",
-                                                        amt=str(amts[0]) if amts else "")])
-                out.evidence["invoices"] = d.name
+                if len(chqs) == 1:
+                    for col, key in (("dis", "dishonour_date"),
+                                     ("reason", "dishonour_reason"),
+                                     ("memo", "memo_date")):
+                        if chqs[0].get(col):
+                            out.values.setdefault(key, chqs[0][col])
+                            out.evidence.setdefault(key, d.name)
+
+            if kind != "recovery":
+                invs = _invoices(t)
+                if invs:
+                    out.values.setdefault("invoices", invs)
+                    out.evidence["invoices"] = d.name
+
+            # A private limited company must never fall through to the
+            # proprietorship wording because the choice widget was untouched.
+            nt = _noticee_type(t)
+            if nt:
+                out.values.setdefault("noticee_type", nt)
+                out.evidence.setdefault("noticee_type", d.name)
+            if nt.startswith("Company"):
+                dirs = _directors(t, out.values.get("noticee_address", ""))
+                if dirs:
+                    out.values.setdefault("directors", dirs)
+                    out.evidence.setdefault("directors", d.name)
             if clause:
                 out.values["clause_no"] = clause[1]
                 out.evidence["clause_no"] = d.name
