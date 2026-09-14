@@ -115,6 +115,17 @@ def validate(kind: str, case: dict, docs=None) -> Report:
     if kind == "s138":
         chq = rows(case, "cheques")
         chq_total = _sum(chq, "amt")
+        # Without this the draft silently falls through to the proprietorship
+        # wording, which misdescribes a company and drops the Section 141 case
+        # against its directors.
+        if not str(case.get("noticee_type", "")).strip():
+            r.blockers.append("Noticee type is not set. A company drafted as a proprietorship "
+                              "misdescribes the drawer and leaves Section 141 unpleaded. "
+                              "Choose company or sole proprietor.")
+        elif str(case.get("noticee_type", "")).startswith("Company") and not rows(case, "directors"):
+            r.blockers.append("The drawer is a company but no director is named as a noticee. "
+                              "Section 141 liability cannot be pleaded against an unnamed director, "
+                              "and the subject line of this notice cites Section 141.")
         chk("pass" if chq else "fail", "Cheque particulars present: number, date, amount, drawn-on bank.")
         chk("pass" if all(case.get(k) for k in ("dishonour_date", "dishonour_reason", "memo_date"))
             else "fail", "Dishonour date, reason and bank memo date present.")
@@ -158,6 +169,11 @@ def validate(kind: str, case: dict, docs=None) -> Report:
 
         nd = parse_date(case.get("notice_date")) or date.today()
         dated = parse_date(case.get("notice_date")) is not None
+        if not dated:
+            r.blockers.append("No date of notice is set. The 30-day window under proviso (b) to "
+                              "Section 138 runs from receipt of the dishonour intimation, so the "
+                              "date is operative wording, not a formality — it will not be "
+                              "defaulted to today.")
         basis = ("the return dates — no bank memo date is recorded, so the return date has been used"
                  if approx else "the bank memo dates")
         late, window = [], []
@@ -181,6 +197,9 @@ def validate(kind: str, case: dict, docs=None) -> Report:
                        "of information of dishonour. Unless the intimations were received materially "
                        "later, the window for these cheques appears to have closed and a notice issued now "
                        "may not support a complaint. This must go to the lawyer before anything is issued.")
+            r.blockers.append("On the dates given, the demand falls outside the 30-day window under "
+                              "proviso (b) to Section 138 for: " + "; ".join(late)
+                              + ". Correct the dates, or take the lawyer's instruction before drafting.")
         elif window:
             add_flag("warn", "The 30-day window on " + basis + " runs — " + "; ".join(window)
                      + ". Verify against the statute and the actual dates of receipt.")
