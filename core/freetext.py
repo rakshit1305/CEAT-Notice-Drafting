@@ -215,7 +215,10 @@ def _parse(kind: str, qid: str, raw: str, case: dict) -> dict:
             v["prior"] = "Don't know"
 
     elif qid == "inv":
-        rows = _rows_from_lines(t, ["no", "date", "amt"])
+        # Pipe/tab/two-space columns first; prose such as "Tax Invoice No. X
+        # dated D for INR A" falls through to the cue-anchored reader, which
+        # does not split an Indian-format amount on its own commas.
+        rows = _rows_from_lines(t, ["no", "date", "amt"]) or _invoices(t)
         if rows:
             v["invoices"] = rows
 
@@ -347,7 +350,11 @@ def _cheques(t: str) -> list[dict]:
              or re.search(r"(?:INR|Rs\.?|₹)\s*(" + MONEY_RX + r")", ch, re.I)
              or re.search(r",\s*(\d[\d,]{4,})\s*,", ch))
         row["amt"] = _money(m.group(1)) if m else ""
-        m = re.search(r"drawn on\s+(.+?)(?=,?\s*(?:dishonou?r|returned|reason|memo)|[.;]|$)", ch, re.I)
+        # The stop-cue list matters: without "issued" the bank field runs on
+        # into ", issued by Noticee No" and only stops at the period in "No.".
+        m = re.search(r"drawn on\s+(.+?)"
+                      r"(?=,?\s*(?:dishonou?r|returned|reason|memo|issued|signed|drawn|"
+                      r"bearing|payable|in favour|under the signature)|[.;]|$)", ch, re.I)
         if m:
             row["bank"] = m.group(1).strip(" ,")
         elif re.search(r"same bank", ch, re.I) and out:
@@ -361,6 +368,84 @@ def _cheques(t: str) -> list[dict]:
         if row["no"] and (row["amt"] or row["date"]):
             out.append(row)
     return out
+
+
+# --------------------------------------------------- invoices / directors --
+# The number cue below is REQUIRED. Without it the alternation backtracks from
+# "invoice" to "inv" on prose such as "Which invoices does the cheque cover?"
+# and the capture group swallows the leftover "oices" as an invoice number.
+INV_RX = re.compile(r"(?:invoices?|inv|bill)\s*(?:no\.?|number|#)\s*[:\-]?\s*"
+                    r"([A-Z0-9][A-Z0-9/\-]{3,24})", re.I)
+
+PERSON_NAME = (r"(?:Mr|Mrs|Ms|Shri|Smt|Sri|Dr|Miss)\.?\s+"
+               r"[A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){0,3}")
+
+
+def _invoices(t: str) -> list[dict]:
+    """Invoice rows out of a narrative or a pasted sheet.
+
+    Line-scoped on purpose: the date and the amount are taken from the same
+    line that carries the invoice number, never from the first date or the
+    first amount found anywhere in the file.
+    """
+    out, seen = [], set()
+    for line in str(t or "").splitlines():
+        m = INV_RX.search(line)
+        if not m:
+            continue
+        no = m.group(1).strip(" .,;:")
+        if not no or no.lower() in seen:
+            continue
+        seen.add(no.lower())
+        tail = line[m.end():]
+        dm = (re.search(r"dated?\s+(" + DATE_RX + r")", tail, re.I)
+              or re.search(r"(" + DATE_RX + r")", tail))
+        am = (re.search(r"(?:for|of|amounting to|sum of)\s*(?:INR|Rs\.?|\u20b9)\s*("
+                        + MONEY_RX + r")", tail, re.I)
+              or re.search(r"(?:INR|Rs\.?|\u20b9)\s*(" + MONEY_RX + r")", tail, re.I))
+        row = dict(no=no,
+                   date=_d(dm.group(1)) if dm else "",
+                   amt=_money(am.group(1)) if am else "")
+        if row["date"] or row["amt"]:
+            out.append(row)
+    return out
+
+
+def _directors(t: str, default_addr: str = "") -> list[dict]:
+    """Directors named as co-noticees. Only lines that actually say 'director'
+    are read, so an authorised signatory mentioned elsewhere is not promoted
+    into a noticee. 'same address' inherits the company's address."""
+    out, seen = [], set()
+    for line in str(t or "").splitlines():
+        if not re.search(r"\bdirectors?\b", line, re.I):
+            continue
+        for m in re.finditer(PERSON_NAME, line):
+            name = re.sub(r"\s+", " ", m.group(0)).strip(" ,.")
+            if len(name.split()) < 2 or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            tail = line[m.end():]
+            if re.search(r"\bsame address\b", tail, re.I):
+                addr = default_addr
+            else:
+                am = re.search(r"\baddress(?:ed at)?\b\s*[:\-]?\s*(.+?)[.;]*$", tail, re.I)
+                addr = am.group(1).strip(" ,.") if am else ""
+            out.append(dict(name=name, address=addr))
+    return out
+
+
+def _noticee_type(t: str) -> str:
+    """Company or proprietorship. Read wherever the party is described — a
+    private limited company must never fall through to the proprietorship
+    wording just because the choice widget was left untouched."""
+    t = str(t or "")
+    if re.search(r"\b(?:sole|individual)\s+propriet|\bproprietorship\b", t, re.I):
+        return "Individual / sole proprietor"
+    if re.search(r"\bdirectors?\b|\bpvt\.?\s*ltd\b|\bprivate limited\b|"
+                 r"\blimited\b|\bllp\b", t, re.I):
+        return "Company + directors"
+    return ""
+
 
 
 def narrative(kind: str, text: str) -> tuple[dict, dict, list]:
@@ -381,10 +466,7 @@ def narrative(kind: str, text: str) -> tuple[dict, dict, list]:
             ev[k] = why
 
     # who
-    if re.search(r"\b(?:sole|individual)\s+propriet|\bproprietorship\b", t, re.I):
-        put("noticee_type", "Individual / sole proprietor")
-    elif re.search(r"\bdirectors?\b|\bpvt\.?\s*ltd|\bprivate limited\b", t, re.I):
-        put("noticee_type", "Company + directors")
+    put("noticee_type", _noticee_type(t))
 
     # A label with a delimiter, so "…from the same drawer." is not mistaken for
     # "Drawer: Om Enterprises".
@@ -403,9 +485,16 @@ def narrative(kind: str, text: str) -> tuple[dict, dict, list]:
         put("firm_name", firm)
     addr = _after(t, r"\baddress(?:ed at)?\b", r"[.;\n]")
     put("noticee_address", addr)
+    if str(v.get("noticee_type", "")).startswith("Company"):
+        dirs = _directors(t, v.get("noticee_address", ""))
+        if dirs:
+            put("directors", dirs, f"{len(dirs)} director(s) named in the account you gave")
 
     # the instruments
     if kind == "s138":
+        inv = _invoices(t)
+        if inv:
+            put("invoices", inv, f"{len(inv)} invoice(s) described in the account you gave")
         chq = _cheques(t)
         if chq:
             put("cheques", chq, f"{len(chq)} cheque(s) described in the account you gave")
