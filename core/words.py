@@ -101,7 +101,7 @@ def to_float(value):
 
 
 def fmt_amount(value) -> str:
-    """8,42,150.00 in the Indian grouping."""
+    """8,42,150 in the Indian grouping; paise shown only when they are real."""
     n = to_float(value)
     if n is None:
         return ""
@@ -114,6 +114,9 @@ def fmt_amount(value) -> str:
         head, tail = s[:-3], s[-3:]
         head = re.sub(r"(\d)(?=(\d\d)+$)", r"\1,", head)
         s = head + "," + tail
+    # A notice writes 2,00,000/- not 2,00,000.00/-. Real paise are kept.
+    if dec == "00":
+        return ("-" if neg else "") + s
     return ("-" if neg else "") + s + "." + dec
 
 
