@@ -298,6 +298,10 @@ def default_case(kind: str) -> dict:
                "mode": "BY SPEED POST",
                "signatory_name": name, "signatory_desig": desig,
                "authority_confirmed": False, "prior": "No"}
+    # These are seeded conveniences, not answers. Without this marker they read
+    # as "already filled" and the date you actually picked, or the mode you
+    # actually chose, could never overwrite them.
+    c["_defaults"] = ["notice_date", "mode", "signatory_name", "signatory_desig"]
     if kind == "recovery":
         c["interest"] = "8"
     if kind == "consumer":
@@ -685,11 +689,14 @@ if go:
         for k, v in (found.values or {}).items():
             if k not in LABELS and k not in TABLE_COLS:
                 continue
-            if is_filled(CASE, k):            # never overwrite the user
+            soft = k in (CASE.get("_defaults") or [])
+            if is_filled(CASE, k) and not soft:   # never overwrite the user
                 continue
             if v in (None, "", [], {}):
                 continue
             CASE[k] = v
+            if soft:
+                CASE["_defaults"] = [x for x in CASE.get("_defaults", []) if x != k]
             applied.append(k)
             evidence[k] = found.evidence.get(k, "")
             if k in TABLE_COLS:
