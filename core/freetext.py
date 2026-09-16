@@ -145,6 +145,22 @@ def _parse(kind: str, qid: str, raw: str, case: dict) -> dict:
         if addr:
             v["noticee_address"] = addr
 
+    elif qid == "chq":
+        # There was no branch here at all: cheque number, date, amount and bank
+        # came only from the model, so a garbled model reply had nothing to fall
+        # back to and printed straight into the notice.
+        chq = _cheques(t)
+        if chq:
+            v["cheques"] = chq
+        v.update(_dates_by_cue(t, {
+            "presented_date": r"present",
+            "memo_date": r"memo|intimation|advice|slip",
+            "dishonour_date": r"return|dishonour|dishonor|unpaid|bounce",
+        }))
+        reason = _quoted(t) or _after(t, r"\b(?:for the reason|reason|reasons?)\b", r"[.;\n]|vide")
+        if reason:
+            v["dishonour_reason"] = reason.strip(" ,;")
+
     elif qid == "bounce":
         v.update(_dates_by_cue(t, {
             "presented_date": r"present",
@@ -241,7 +257,12 @@ def _parse(kind: str, qid: str, raw: str, case: dict) -> dict:
     elif qid == "client":
         segs = _segs(t)
         if segs:
-            v["client_name"] = segs[0]
+            # "Mr Prakash Desai bought CEAT tyres from ..." — the name ends at
+            # the verb. Trim the NAME only; the full text still feeds the
+            # dealer and product parsers below.
+            v["client_name"] = re.sub(
+                r"\s+\b(?:bought|purchased|acquired|has|had)\b.*$", "", segs[0], flags=re.I | re.S
+            ).strip(" ,;")
         rel = next((s for s in segs[1:] if re.search(r"owner|driver|purchaser|user|consumer", s, re.I)), "")
         if rel:
             v["client_relation"] = rel
@@ -250,7 +271,10 @@ def _parse(kind: str, qid: str, raw: str, case: dict) -> dict:
             v["product"] = prod
         dealer = _after(t, r"\bfrom\b")
         if dealer:
-            v["dealer"] = re.sub(r"^(?:m/s\s+)?", "", dealer, flags=re.I)
+            d = re.sub(r"^(?:m/s\s+)?", "", dealer, flags=re.I)
+            # drop the invoice tail: "... , vide Tax Invoice No. STW/2026/1184"
+            d = re.split(r"\s*,?\s*\b(?:vide|vide\s+invoice|invoice\s+no)\b", d, flags=re.I)[0]
+            v["dealer"] = d.strip(" ,;")
         addr = next((s for s in segs[1:] if ADDR_START.match(s)), "")
         if addr:
             v["client_address"] = addr
@@ -417,7 +441,7 @@ def _directors(t: str, default_addr: str = "") -> list[dict]:
     into a noticee. 'same address' inherits the company's address."""
     out, seen = [], set()
     for line in str(t or "").splitlines():
-        if not re.search(r"\bdirectors?\b", line, re.I):
+        if not re.search(r"\bdirectors?\b|\bpartners?\b", line, re.I):
             continue
         for m in re.finditer(PERSON_NAME, line):
             name = re.sub(r"\s+", " ", m.group(0)).strip(" ,.")
@@ -439,6 +463,8 @@ def _noticee_type(t: str) -> str:
     private limited company must never fall through to the proprietorship
     wording just because the choice widget was left untouched."""
     t = str(t or "")
+    if re.search(r"\bpartnership\s+firm\b|\bpartnership\s+act\b|\bpartners?\b", t, re.I):
+        return "Partnership + partners"
     if re.search(r"\b(?:sole|individual)\s+propriet|\bproprietorship\b", t, re.I):
         return "Individual / sole proprietor"
     if re.search(r"\bdirectors?\b|\bpvt\.?\s*ltd\b|\bprivate limited\b|"
