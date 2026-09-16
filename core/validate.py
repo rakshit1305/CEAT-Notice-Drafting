@@ -122,7 +122,7 @@ def validate(kind: str, case: dict, docs=None) -> Report:
             r.blockers.append("Noticee type is not set. A company drafted as a proprietorship "
                               "misdescribes the drawer and leaves Section 141 unpleaded. "
                               "Choose company or sole proprietor.")
-        elif str(case.get("noticee_type", "")).startswith("Company") and not rows(case, "directors"):
+        elif str(case.get("noticee_type", "")).startswith(("Company","Partnership")) and not rows(case, "directors"):
             r.blockers.append("The drawer is a company but no director is named as a noticee. "
                               "Section 141 liability cannot be pleaded against an unnamed director, "
                               "and the subject line of this notice cites Section 141.")
@@ -214,9 +214,9 @@ def validate(kind: str, case: dict, docs=None) -> Report:
                              "notice is the intended course rather than separate notices.")
         chk("pass", "Subject cites Section 138 r/w Section 141, NI Act, 1881.")
         chk("pass", "Demand gives 15 (FIFTEEN) days from receipt.")
-        chk("pass" if case.get("noticee_type", "").startswith("Company")
+        chk("pass" if case.get("noticee_type", "").startswith(("Company","Partnership"))
             and rows(case, "directors") else
-            ("na" if not case.get("noticee_type", "").startswith("Company") else "fail"),
+            ("na" if not case.get("noticee_type", "").startswith(("Company","Partnership")) else "fail"),
             "Company drawer: directors named as noticees; Section 141 applies.")
 
     if kind == "recovery":
@@ -318,7 +318,53 @@ def validate(kind: str, case: dict, docs=None) -> Report:
         elif getattr(d, "dropped_chars", 0):
             add_flag("warn", f"{d.name}: the end of this document was not read (over the "
                              f"{MAX_DOC_CHARS}-character limit). Check nothing relied on sits past the cut.")
+    # ---- 7. statement of account must belong to this counterparty ---------
+    # The ledger the app reads usually covers every dealer. If rows from other
+    # customers survive into this notice they disclose a third party's data and
+    # inflate the demand, so both are stopped here rather than flagged.
+    soa = rows(case, "soa")
+    if soa:
+        listed = round(_sum(soa, "amount"), 2)
+        if amt and listed and abs(listed - round(float(amt), 2)) > 1:
+            r.blockers.append(
+                f"The statement of account lists {len(soa)} row(s) totalling INR {fmt_amount(listed)}, "
+                f"but the notice demands INR {fmt_amount(amt)}. One of them is drawn from the wrong "
+                f"rows — most often the whole ledger rather than this counterparty's rows."
+            )
+        who = " ".join(_tokens_of(case.get("noticee_name")))
+        if who:
+            foreign = []
+            for row in soa:
+                party = str(row.get("party") or row.get("name") or "").strip()
+                if party and not _same_party(party, case.get("noticee_name")):
+                    foreign.append(party)
+            if foreign:
+                r.blockers.append(
+                    f"The statement of account contains rows belonging to {len(set(foreign))} other "
+                    f"party/parties ({', '.join(sorted(set(foreign))[:3])}…). They must not appear in a "
+                    f"notice addressed to {case.get('noticee_name')} — this discloses another customer's "
+                    f"data and inflates the demand."
+                )
+
     return r
+
+
+
+
+def _tokens_of(name) -> set:
+    import re as _re
+    stop = {"the", "and", "ltd", "limited", "pvt", "private", "mr", "mrs", "shri",
+            "prop", "proprietor", "company", "messrs", "co"}
+    return {w for w in _re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).split()
+            if len(w) > 2 and w not in stop}
+
+
+def _same_party(a, b) -> bool:
+    """Substance match, so 'Pvt Ltd' vs 'Private Limited' is not a difference."""
+    ta, tb = _tokens_of(a), _tokens_of(b)
+    if not ta or not tb:
+        return True                      # nothing to compare on — do not cry wolf
+    return bool(ta & tb) and len(ta & tb) >= min(2, min(len(ta), len(tb)))
 
 
 def _days(a, b):
