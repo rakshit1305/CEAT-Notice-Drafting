@@ -4,6 +4,7 @@ Every paragraph here is the skill's template wording. Only the bracketed facts
 vary. Anything unsupplied renders as [● label] — never a guess.
 """
 from __future__ import annotations
+import re
 import io
 from dataclasses import dataclass, field
 
@@ -69,13 +70,29 @@ def chq_facts(case, chq):
     return rows, len({r[1:] for r in rows}) <= 1
 
 
+
+def multi(case) -> bool:
+    """Company+directors or Partnership+partners — both give numbered noticees."""
+    t = str(case.get("noticee_type", "") or "")
+    return t.startswith("Company") or t.startswith("Partnership")
+
+
+def capacity(case) -> str:
+    return "Partner" if str(case.get("noticee_type", "") or "").startswith("Partnership") else "Director"
+
+
 def noticee_block(case) -> str:
     lines = []
-    if str(case.get("noticee_type", "")).startswith("Company"):
+    if multi(case):
         lines += ["Noticee No. 1", V(case, "noticee_name"), V(case, "noticee_address")]
         for i, d in enumerate(rows(case, "directors"), start=2):
             if str(d.get("name", "")).strip():
                 lines += ["", f"Noticee No. {i}", d["name"]]
+                # The reference names the capacity and the company under each
+                # director, so the block reads as a proper addressee.
+                company = str(case.get("noticee_name") or "").strip()
+                cap = str(d.get("capacity") or capacity(case)).strip()
+                lines.append(f"{cap}, {company}" if company else cap)
                 if str(d.get("address", "")).strip():
                     lines.append(d["address"])
     else:
@@ -118,15 +135,37 @@ def _presented(case) -> str:
 
 def _drawer_phrase(case) -> str:
     """Who signed the cheque — material where the drawer is a company."""
-    if not str(case.get("noticee_type", "")).startswith("Company"):
+    if not multi(case):
         return ""
     return (", issued by Noticee No. 1 under the signature of its authorised "
             "signatory/director")
 
 
+def _rate(case) -> str:
+    """Bare rate. The answer box often already holds "8% p.a.", and the template
+    appends "% p.a." itself — which printed "@ 8% p.a.% p.a."."""
+    r = str(case.get("interest") or "8").strip()
+    r = re.sub(r"\s*%?\s*(p\.?\s*a\.?|per\s+annum)\s*$", "", r, flags=re.I)
+    return r.rstrip("%").strip() or "8"
+
+
+def _authorised_dealer(case) -> bool:
+    """Was the purchase from an authorised CEAT dealer?
+
+    The no-privity defence asserts the client did NOT buy from us or our
+    authorised dealer. Asserting that when the invoice says "Authorised Dealer –
+    CEAT Limited" is a false statement in a signed reply, so the block switches.
+    """
+    blob = " ".join(str(case.get(k) or "") for k in
+                    ("dealer", "client_relation", "product", "incoming", "extra_notes"))
+    if re.search(r"\bOEM\b|original equipment", blob, re.I):
+        return False
+    return bool(re.search(r"authori[sz]ed\s+(?:CEAT\s+)?dealer|CEAT\s+authori[sz]ed", blob, re.I))
+
+
 def you(case) -> str:
     return ("you Noticees, jointly and severally,"
-            if str(case.get("noticee_type", "")).startswith("Company") else "you")
+            if multi(case) else "you")
 
 
 def sig_block(case) -> str:
@@ -162,7 +201,15 @@ def build(kind: str, case: dict) -> tuple[str, list[Block]]:
                   "Companies Act, 1956, having our registered office at the address mentioned above. "
                   "We deal in the business of manufacture and sale of Tyres, Tubes and Flaps "
                   "(hereinafter referred to as the “Goods”).")
-        if str(case.get("noticee_type", "")).startswith("Company"):
+        if str(case.get("noticee_type", "")).startswith("Partnership"):
+            dirs = [d.get("name", "") for d in rows(case, "directors") if d.get("name")]
+            li.append(f"That you Noticee No. 1, {V(case,'noticee_name')}, are a partnership firm "
+                      f"registered under the Indian Partnership Act, 1932, engaged in "
+                      f"{V(case,'business','nature of business')}; and "
+                      f"{_dir_phrase(dirs)}, "
+                      "are its partners responsible for its management and day-to-day operations, "
+                      "and are jointly and severally liable for the obligations of the said firm.")
+        elif str(case.get("noticee_type", "")).startswith("Company"):
             dirs = [d.get("name", "") for d in rows(case, "directors") if d.get("name")]
             li.append(f"That you Noticee No. 1, {V(case,'noticee_name')}, are a company registered in India "
                       f"engaged in {V(case,'business','nature of business')}; and "
@@ -249,7 +296,7 @@ def build(kind: str, case: dict) -> tuple[str, list[Block]]:
         tail = ["Please note that a copy of this notice has been retained by us for future reference."]
 
     elif kind == "recovery":
-        rate = str(case.get("interest") or "8").strip()
+        rate = _rate(case)
         subject = (f"Demand notice for recovery of dues amounting to {M(case,'amount')} ({W(case)}) "
                    f"along with interest @ {rate}% p.a.")
         opening = None
@@ -292,7 +339,7 @@ def build(kind: str, case: dict) -> tuple[str, list[Block]]:
                   "demonstrating a false and fraudulent intention from the beginning. Your acts and conduct "
                   "are patently illegal, untenable and contrary to settled principles of law.")
         li.append("In the aforesaid circumstances, the Company hereby calls upon you to pay the aforesaid "
-                  f"sum of {M(case,'amount')} ({W(case)}) along with interest @ {rate}% p.a.")
+                  f"sum of {M(case,'amount')} ({W(case)}) along with interest @ {_rate(case)}% p.a.")
         li.append("Through your deliberate and wilful actions you have deceived and cheated the Company, "
                   "attracting the penal provisions of Sections 316(2) and 318(4) of the Bharatiya Nyaya "
                   "Sanhita, 2023, causing wrongful loss to the Company and wrongful gain to yourself.")
@@ -323,12 +370,22 @@ def build(kind: str, case: dict) -> tuple[str, list[Block]]:
                 "under claim to be submitted for inspection; our Technical Service Engineer examines the "
                 "item and the disposition is communicated with a copy of the inspection report.")))
         if case.get("blk_c") is not False:
-            blocks.append(Block("p", text=(
-                "C) It is an admitted fact that your client has not purchased tyres from us or our "
-                f"authorized dealer. Your client purchased {V(case,'product','vehicle / product')} from "
-                f"{V(case,'dealer','dealer / OEM')}. We have no contractual, commercial or legal "
-                "relationship with your client. In the absence of privity of contract, we neither owe any "
-                "obligation nor bear any responsibility towards your client.")))
+            if _authorised_dealer(case):
+                # The purchase WAS from an authorised dealer. Asserting the
+                # opposite here would be a false statement in a signed reply.
+                c_text = ("C) We note that the purchase relied upon was made from "
+                          f"{V(case,'dealer','dealer / OEM')}, which describes itself as an authorised "
+                          "dealer of the Company. That invoice is the dealer's own document, and the sale "
+                          "recorded therein is a sale by the dealer to your client on a principal-to-"
+                          "principal basis. Our obligations, if any, are confined to the limited warranty "
+                          "referred to above and to the procedure prescribed thereunder.")
+            else:
+                c_text = ("C) It is an admitted fact that your client has not purchased tyres from us or "
+                          f"our authorized dealer. Your client purchased {V(case,'product','vehicle / product')} "
+                          f"from {V(case,'dealer','dealer / OEM')}. We have no contractual, commercial or "
+                          "legal relationship with your client. In the absence of privity of contract, we "
+                          "neither owe any obligation nor bear any responsibility towards your client.")
+            blocks.append(Block("p", text=c_text))
         if str(case.get("claim_date", "")).strip() or str(case.get("inspection", "")).strip():
             t = (f"For the record: we received the warranty claim on {D(case,'claim_date','claim date')}; "
                  f"on inspection the item was found {V(case,'inspection','inspection finding')}, and it is "
