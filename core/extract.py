@@ -28,6 +28,28 @@ class Doc:
     note: str = ""
     digest: str = ""
 
+    @property
+    def dropped_rows(self) -> int:
+        """Rows in the file that MAX_SHEET_ROWS kept from the model.
+
+        validate.py already blocks on this; without the property it read 0
+        through getattr and a truncated ledger passed silently.
+        """
+        if self.kind != "tables":
+            return 0
+        return sum(max(0, len(t["rows"]) - MAX_SHEET_ROWS) for t in self.tables)
+
+    @property
+    def dropped_chars(self) -> int:
+        if self.kind == "tables":
+            full = 0
+            for t in self.tables:
+                for r in t["rows"]:
+                    full += len(" | ".join("" if c is None else str(c).strip() for c in r)) + 1
+        else:
+            full = len(self.text or "")
+        return max(0, full - MAX_DOC_CHARS)
+
     def as_prompt(self) -> str:
         """A compact, faithful rendering for the model."""
         if self.kind == "tables":
