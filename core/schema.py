@@ -78,7 +78,7 @@ TABLE_COLS = {
     "soa":      [("ref", "Invoice / reference"), ("date", "Document date"), ("amt", "Outstanding (INR)")],
     "prices":   [("sku", "Product / SKU"), ("old", "Existing price"), ("nw", "Revised price"),
                  ("pct", "% change")],
-    "directors":[("name", "Director name"), ("address", "Address")],
+    "directors":[("name", "Director / partner name"), ("address", "Address")],
     "paras":    [("n", "Para"), ("stance", "Stance"), ("text", "Response")],
     "demands":  [("d", "Demand"), ("resp", "Response"), ("note", "Note")],
 }
@@ -123,7 +123,8 @@ CRITICAL = {
 _PARTY = [
     Q("party", "Who is the noticee?", ["noticee_type"], kind="choice",
       options=[("Individual / sole proprietor", "Individual / proprietor", "Single addressee block"),
-               ("Company + directors", "Company + directors", "Joint & several liability")]),
+               ("Company + directors", "Company + directors", "Joint & several liability"),
+               ("Partnership + partners", "Partnership firm + partners", "Joint & several liability")]),
     Q("addr", "Who is it addressed to — full name(s) and address?",
       ["noticee_name", "noticee_address"], attach=True,
       ph="e.g. M/s Sharma Tyres, Prop. Mr. Rakesh Sharma, Shop 14, MG Road, Jaipur – 302001. "
