@@ -534,6 +534,53 @@ def _fix_noticees(case: dict, found: Found) -> Found:
     return found
 
 
+def _filter_from_docs(docs, party: str, key: str):
+    """Filter the attached ledger to one party, independently of everything else.
+
+    The substitution used to depend on the deterministic reader having produced
+    rows. When that came back empty — no party column found, a name it could not
+    match — there was no floor, the model's whole-ledger answer stood, and the
+    user was stuck behind a blocker with no way forward. This goes back to the
+    file and does the filtering itself.
+    """
+    want = _tokens(party)
+    if not want or not docs:
+        return [], None, ""
+    for d in docs:
+        if getattr(d, "kind", "") != "tables":
+            continue
+        for t in getattr(d, "tables", []) or []:
+            rows_ = t["rows"]
+            hi = _header_row(rows_)
+            header = [str(c).strip() for c in rows_[hi]]
+            body = [r for r in rows_[hi + 1:] if any(str(c).strip() for c in r)]
+            if not body:
+                continue
+            cols = _sniff(header, body)
+            if cols["party"] < 0 or cols["amt"] < 0:
+                continue
+            hits = [r for r in body
+                    if any(w in re.sub(r"[^a-z0-9]+", " ", str(r[cols['party']]).lower())
+                           for w in want)]
+            if not hits or len(hits) == len(body):
+                continue
+            out_rows, total = [], 0.0
+            for r in hits:
+                amt = to_float(r[cols["amt"]]) if cols["amt"] < len(r) else None
+                total += amt or 0.0
+                row = {"amt": str(int(amt)) if amt is not None and amt == int(amt) else str(amt or "")}
+                if cols["ref"] >= 0 and cols["ref"] < len(r):
+                    row["ref"] = str(r[cols["ref"]]).strip()
+                if cols["date"] >= 0 and cols["date"] < len(r):
+                    row["date"] = iso(r[cols["date"]]) or ""
+                out_rows.append(row)
+            col_name = str(header[cols["amt"]]).strip() or f"column {cols['amt'] + 1}"
+            ev = (f"{d.name}, sheet “{t['sheet']}”: {len(out_rows)} row(s) matching “{party}”, "
+                  f"summed on “{col_name}”")
+            return out_rows, round(total, 2), ev
+    return [], None, ""
+
+
 def _rows_total(rows_) -> float:
     t = 0.0
     for r in rows_ or []:
@@ -553,7 +600,7 @@ def _consistent(vals: dict, key: str) -> bool:
     return abs(_rows_total(rows_) - round(amt, 2)) <= 1
 
 
-def _prefer_filtered_rows(base: Found, merged: Found, case: dict) -> Found:
+def _prefer_filtered_rows(base: Found, merged: Found, case: dict, docs=None) -> Found:
     """Keep the deterministic filtered read when the merged one does not add up.
 
     Two ways this goes wrong. The model returns the whole ledger, or — worse,
@@ -567,22 +614,32 @@ def _prefer_filtered_rows(base: Found, merged: Found, case: dict) -> Found:
     for key in ("soa", "invoices"):
         m_rows = merged.values.get(key) or []
         b_rows = base.values.get(key) or []
-        if not isinstance(m_rows, list) or not isinstance(b_rows, list) or not b_rows:
+        b_vals = base.values
+        b_ev = base.evidence
+        if not b_rows:
+            # No floor from the deterministic pass — go back to the file itself.
+            f_rows, f_total, f_ev = _filter_from_docs(
+                docs or [], str(case.get("noticee_name") or case.get("client_name") or ""), key)
+            if f_rows and f_total is not None:
+                b_rows = f_rows
+                b_vals = {key: f_rows, "amount": f_total}
+                b_ev = {key: f_ev, "amount": f_ev}
+        if not isinstance(m_rows, list) or not b_rows:
             continue
 
         whole_ledger = len(m_rows) > 40 and len(b_rows) * 3 < len(m_rows)
         mismatch = bool(m_rows) and not _consistent(merged.values, key)
         if not (whole_ledger or mismatch):
             continue
-        if not _consistent(base.values, key):
+        if not _consistent(b_vals, key):
             continue                      # the floor is no better — leave the blocker
 
         old_amt = to_float(merged.values.get("amount")) or 0
         merged.values[key] = b_rows
-        merged.values["amount"] = base.values["amount"]
+        merged.values["amount"] = b_vals["amount"]
         for k in (key, "amount"):
-            if base.evidence.get(k):
-                merged.evidence[k] = base.evidence[k]
+            if b_ev.get(k):
+                merged.evidence[k] = b_ev[k]
         if whole_ledger:
             why = (f"the model returned {len(m_rows)} rows — the whole ledger rather than "
                    f"{case.get('noticee_name') or 'this counterparty'}'s rows")
@@ -592,7 +649,7 @@ def _prefer_filtered_rows(base: Found, merged: Found, case: dict) -> Found:
                    f"INR {fmt_amount(old_amt)}, which do not agree")
         merged.notes.append(
             f"Statement of account: {why}. The filtered reading of {len(b_rows)} row(s) totalling "
-            f"INR {fmt_amount(base.values['amount'])} was used instead, so the figure demanded is the "
+            f"INR {fmt_amount(b_vals['amount'])} was used instead, so the figure demanded is the "
             f"sum of the invoices the notice lists.")
     return merged
 
@@ -675,4 +732,4 @@ def analyse(kind: str, case: dict, docs: list[Doc]) -> Found:
                 merged.evidence[k] = got.evidence[k]
         merged.missing += [m for m in got.missing if m not in merged.missing]
         merged.notes += [n for n in got.notes if n not in merged.notes]
-    return _fix_noticees(case, with_typed(_prefer_filtered_rows(base, merged, case)))
+    return _fix_noticees(case, with_typed(_prefer_filtered_rows(base, merged, case, docs)))
