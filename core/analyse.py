@@ -308,6 +308,21 @@ def deterministic(kind: str, case: dict, docs: list[Doc]) -> Found:
                         f"{d.name}: no party/customer column was found, so the rows could not be "
                         f"narrowed to “{known_party}”. Any total here would cover every counterparty "
                         f"in the file — check it before use.")
+                elif not want and cols["party"] >= 0:
+                    # The sheet has a party column, so it CAN be narrowed — but the
+                    # counterparty is not known yet at this pass (it is likely still
+                    # to be read out of another attached document, e.g. by the model
+                    # later in this same analyse() call). Handing back every row here
+                    # would silently pass off the whole ledger as this party's
+                    # statement, which is exactly the failure this filter exists to
+                    # stop. Leave the table alone; the later filtered-rows fallback
+                    # (which does know how to look the name up) picks it up once the
+                    # name is known.
+                    out.notes.append(
+                        f"{d.name}: the counterparty's name is not known yet, so its "
+                        f"{len(body)} row(s) were not taken from this file at this pass — "
+                        f"narrowing happens once the name is read.")
+                    continue
 
                 spec = TABLE_COLS.get(table_key, [])
                 built = []
@@ -600,7 +615,7 @@ def _consistent(vals: dict, key: str) -> bool:
     return abs(_rows_total(rows_) - round(amt, 2)) <= 1
 
 
-def _prefer_filtered_rows(base: Found, merged: Found, case: dict, docs=None) -> Found:
+def _prefer_filtered_rows(base: Found, merged: Found, case: dict, docs=None, kind: str = "") -> Found:
     """Keep the deterministic filtered read when the merged one does not add up.
 
     Two ways this goes wrong. The model returns the whole ledger, or — worse,
@@ -611,15 +626,25 @@ def _prefer_filtered_rows(base: Found, merged: Found, case: dict, docs=None) -> 
     party column and summed exactly the rows it kept, so where it is internally
     consistent and the merge is not, it is put back as a pair.
     """
-    for key in ("soa", "invoices"):
+    # Only the one table field this notice kind actually uses — matching
+    # deterministic()'s own table_key. Checking the other field too (as this
+    # used to) meant a "missing" floor for "soa" also stuffed identical rows
+    # into "invoices" (or vice versa) on notice kinds that never asked for it.
+    table_key = "soa" if kind == "recovery" else ("prices" if kind == "price" else "invoices")
+    for key in (table_key,):
         m_rows = merged.values.get(key) or []
         b_rows = base.values.get(key) or []
         b_vals = base.values
         b_ev = base.evidence
         if not b_rows:
             # No floor from the deterministic pass — go back to the file itself.
-            f_rows, f_total, f_ev = _filter_from_docs(
-                docs or [], str(case.get("noticee_name") or case.get("client_name") or ""), key)
+            # The name may only exist because the model just read it out of an
+            # attached document (e.g. a covering letter) rather than a typed
+            # answer, so check what the merge has found so far before falling
+            # back to the raw case dict.
+            known = str(merged.values.get("noticee_name") or merged.values.get("client_name")
+                        or case.get("noticee_name") or case.get("client_name") or "")
+            f_rows, f_total, f_ev = _filter_from_docs(docs or [], known, key)
             if f_rows and f_total is not None:
                 b_rows = f_rows
                 b_vals = {key: f_rows, "amount": f_total}
@@ -629,7 +654,12 @@ def _prefer_filtered_rows(base: Found, merged: Found, case: dict, docs=None) -> 
 
         whole_ledger = len(m_rows) > 40 and len(b_rows) * 3 < len(m_rows)
         mismatch = bool(m_rows) and not _consistent(merged.values, key)
-        if not (whole_ledger or mismatch):
+        # The model may simply not have returned this field at all — e.g. it left
+        # the ledger to the table reader, and that reader had no name to filter on
+        # until this same merge established one. That is not a "bad answer" to
+        # repair, it is a missing one to fill, and the floor is exactly what fills it.
+        missing = not m_rows and bool(b_rows)
+        if not (whole_ledger or mismatch or missing):
             continue
         if not _consistent(b_vals, key):
             continue                      # the floor is no better — leave the blocker
@@ -643,10 +673,12 @@ def _prefer_filtered_rows(base: Found, merged: Found, case: dict, docs=None) -> 
         if whole_ledger:
             why = (f"the model returned {len(m_rows)} rows — the whole ledger rather than "
                    f"{case.get('noticee_name') or 'this counterparty'}'s rows")
-        else:
+        elif mismatch:
             why = (f"the model's {len(m_rows)} row(s) totalled "
                    f"INR {fmt_amount(_rows_total(m_rows))} against a demand of "
                    f"INR {fmt_amount(old_amt)}, which do not agree")
+        else:
+            why = "no rows had been read for it yet"
         merged.notes.append(
             f"Statement of account: {why}. The filtered reading of {len(b_rows)} row(s) totalling "
             f"INR {fmt_amount(b_vals['amount'])} was used instead, so the figure demanded is the "
@@ -732,4 +764,4 @@ def analyse(kind: str, case: dict, docs: list[Doc]) -> Found:
                 merged.evidence[k] = got.evidence[k]
         merged.missing += [m for m in got.missing if m not in merged.missing]
         merged.notes += [n for n in got.notes if n not in merged.notes]
-    return _fix_noticees(case, with_typed(_prefer_filtered_rows(base, merged, case, docs)))
+    return _fix_noticees(case, with_typed(_prefer_filtered_rows(base, merged, case, docs, kind)))
