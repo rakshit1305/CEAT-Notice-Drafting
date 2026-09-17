@@ -1,330 +1,602 @@
-"""The question set and the field model.
+"""Read the fields out of what the user actually typed.
 
-One flat list of questions per notice type, exactly as the console shows them.
-`critical` marks the handful of fields a notice cannot assert without —
-everything else is optional and renders as [● ...] if left open.
+Several questions collect more than one field in one box — "who is it addressed
+to, name and address", "how and when did it bounce". Documents are read by
+analyse.deterministic and by the model; this module reads the *typed* answer,
+so the console still works with no API key and no attachment.
+
+This is reading, not inference. Nothing here supplies a fact the user did not
+write; where the text does not clearly carry a field, the field stays empty and
+shows as [● …] in the draft. Whatever is picked up is echoed back under the
+question so it can be corrected.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
+import re
+
+from .words import find_amounts, find_dates, iso, parse_date
+
+# ---------------------------------------------------------------- helpers --
+ADDR_START = re.compile(
+    r"^\s*(?:\d+[\-/A-Za-z]*\b|shop\b|plot\b|flat\b|no\.?\s*\d|h\.?\s*no\b|door\b|office\b|"
+    r"unit\b|survey\b|gala\b|godown\b|building\b|bldg\b|block\b|floor\b|near\b|opp\b|"
+    r"behind\b|sector\b|phase\b|khasra\b)", re.I)
+PROP = re.compile(r"^\s*(?:prop\.?|proprietor|partner|director)\b[:.,\s]*", re.I)
+PERSON = re.compile(r"\b(?:mr|mrs|ms|shri|smt|sri|dr|miss)\b\.?", re.I)
+FIRMY = re.compile(r"\b(?:m/s|enterprises?|traders?|trading|agenc(?:y|ies)|industries|tyres?|"
+                   r"&\s*co|and co|pvt|private|limited|ltd|llp|corporation|company|"
+                   r"sons|brothers|associates|stores?|motors?)\b", re.I)
+ROLE = re.compile(r"(manager|counsel|head|director|officer|secretary|advocate|partner|"
+                  r"president|vice|legal|gm|dgm|agm|avp|vp)\b", re.I)
 
 
-@dataclass
-class Q:
-    id: str
-    ask: str
-    fills: list[str]                     # field keys this answer supplies
-    kind: str = "textarea"               # textarea | text | date | choice | chips | table
-    hint: str = ""
-    ph: str = ""
-    options: list = field(default_factory=list)
-    attach: bool = False                 # show the inline uploader
-    rows: int = 3
-    table: str = ""                      # for kind == "table"
+def _lines(t: str) -> list[str]:
+    return [l.strip(" \t·-–—") for l in str(t or "").splitlines() if l.strip(" \t·-–—")]
 
 
-MODES = ["BY SPEED POST",
-         "THROUGH SPEED POST / EMAIL / WHATSAPP",
-         "BY EMAIL", "BY WHATSAPP", "BY COURIER", "BY HAND DELIVERY"]
-
-# human labels for every field key the app can hold
-LABELS = {
-    "noticee_type": "Noticee type", "noticee_name": "Noticee name",
-    "noticee_address": "Address", "firm_name": "Proprietorship concern",
-    "business": "Nature of the company's business", "directors": "Directors",
-    "background": "How the dealing arose", "relationship": "How the dealing arose",
-    "invoices": "Invoices", "cheques": "Cheque particulars", "soa": "Statement of account",
-    "presented_date": "Date presented", "dishonour_date": "Date of dishonour",
-    "dishonour_reason": "Reason on the memo", "memo_date": "Bank memo date",
-    "part_payment": "Part-payments", "amount": "Amount", "amount_words": "Amount in words",
-    "as_on_date": "Outstanding as on", "interest": "Interest rate",
-    "principal": "Principal component", "tax": "GST / tax component",
-    "jurisdiction": "Place of jurisdiction", "prior": "Prior notice",
-    "prior_date": "Prior notice date", "prior_ref": "Prior notice subject",
-    "current_instrument": "This notice covers only",
-    "mode": "Mode of service", "signatory_name": "Signatory",
-    "signatory_desig": "Designation", "authority_confirmed": "Signing authority confirmed",
-    "notice_date": "Date of notice", "extra_notes": "Anything else",
-    "incoming": "Incoming notice", "advocate_name": "Advocate's name",
-    "advocate_address": "Advocate's address", "reply_date": "Date of this reply",
-    "client_name": "Client's name", "client_relation": "Client described as",
-    "client_address": "Client's address", "product": "Product purchased",
-    "dealer": "Dealer / OEM", "claim_date": "Warranty claim received",
-    "inspection": "Inspection finding", "rejection": "Disposition communicated",
-    "paras": "Para-by-para responses", "demands": "Demands raised",
-    "blk_a": "Block A — principal to principal", "blk_b": "Block B — warranty procedure",
-    "blk_c": "Block C — no privity",
-    "agreement_name": "Agreement title", "agreement_date": "Agreement date",
-    "clause_no": "Clause", "obligation": "The obligation", "breach_facts": "Particulars of the breach",
-    "cure_period": "Cure period", "consequences": "Consequences if not cured",
-    "subject_of": "What the agreement governs", "ground": "Ground",
-    "facts": "Facts", "cure_given_date": "Cure period given on",
-    "cure_lapsed_date": "Cure period lapsed on", "notice_period": "Notice period",
-    "effective_date": "Effective date", "dues": "Outstanding dues",
-    "wind_down": "Wind-down obligations", "expiry_date": "Expiry date",
-    "intent": "Intent", "renewal_term": "Renewal term", "revised_terms": "Revised terms",
-    "confirm_by": "Confirm acceptance by", "direction": "Direction",
-    "fm_event": "The event", "fm_date": "Event began on", "affected": "Affected obligations",
-    "impact": "Expected impact / duration", "mitigation": "Mitigation steps",
-    "relief": "Relief sought", "reason": "Reason for the revision",
-    "prices": "Revised prices", "pre_orders": "Orders placed before the effective date",
-}
-
-TABLE_COLS = {
-    "invoices": [("no", "Invoice no."), ("date", "Date"), ("amt", "Amount (INR)")],
-    "cheques":  [("no", "Cheque no."), ("date", "Cheque date"), ("amt", "Amount (INR)"),
-                 ("bank", "Drawn on (bank & branch)"),
-                 ("dis", "Returned unpaid on"), ("reason", "Return reason"),
-                 ("memo", "Bank memo dated")],
-    "soa":      [("ref", "Invoice / reference"), ("date", "Document date"), ("amt", "Outstanding (INR)")],
-    "prices":   [("sku", "Product / SKU"), ("old", "Existing price"), ("nw", "Revised price"),
-                 ("pct", "% change")],
-    "directors":[("name", "Director / partner name"), ("address", "Address")],
-    "paras":    [("n", "Para"), ("stance", "Stance"), ("text", "Response")],
-    "demands":  [("d", "Demand"), ("resp", "Response"), ("note", "Note")],
-}
-DATE_COLS = {"date", "dis", "memo"}
-NUM_COLS = {"amt", "old", "nw"}
-
-# Facts that may be carried per cheque instead of once for the whole notice.
-# Several cheques from one drawer rarely bounce on the same day.
-CHQ_ROLLUP = {"dis": "dishonour_date", "reason": "dishonour_reason", "memo": "memo_date"}
-
-TYPES = {
-    "s138":        dict(name="Section 138 demand notice", blurb="Cheque dishonour", tier="approved"),
-    "recovery":    dict(name="Recovery notice", blurb="Outstanding dues, no cheque", tier="approved"),
-    "consumer":    dict(name="Reply to a consumer notice", blurb="Inbound consumer notice", tier="approved"),
-    "breach":      dict(name="Breach / default notice", blurb="Call to cure", tier="ns"),
-    "termination": dict(name="Termination notice", blurb="End an agreement", tier="ns"),
-    "renewal":     dict(name="Renewal / non-renewal notice", blurb="Nearing expiry", tier="ns"),
-    "fm":          dict(name="Force majeure notice", blurb="Invoke or respond", tier="ns"),
-    "price":       dict(name="Price adjustment notice", blurb="Price revision", tier="ns"),
-}
-
-# the only fields that stop a notice being drafted
-CRITICAL = {
-    # The bank memo date is NOT here on purpose: without it the notice simply
-    # reads "[● bank memo date]" and the validator computes the statutory window
-    # from the return date instead, flagging that it did so. Blocking on it
-    # stopped otherwise-complete matters dead. A judgment call — if CEAT's
-    # lawyers want it to be a hard stop, add "memo_date" back to this list.
-    "s138":        ["noticee_name", "noticee_address", "cheques", "dishonour_date",
-                    "dishonour_reason", "amount"],
-    "recovery":    ["noticee_name", "noticee_address", "amount", "as_on_date"],
-    "consumer":    ["incoming", "advocate_name", "client_name"],
-    "breach":      ["noticee_name", "noticee_address", "agreement_name", "clause_no", "breach_facts"],
-    "termination": ["noticee_name", "noticee_address", "agreement_name", "clause_no",
-                    "ground", "effective_date"],
-    "renewal":     ["noticee_name", "noticee_address", "agreement_name", "expiry_date", "intent"],
-    "fm":          ["noticee_name", "noticee_address", "agreement_name", "clause_no",
-                    "fm_event", "fm_date"],
-    "price":       ["noticee_name", "noticee_address", "prices", "effective_date"],
-}
-
-_PARTY = [
-    Q("party", "Who is the noticee?", ["noticee_type"], kind="choice",
-      options=[("Individual / sole proprietor", "Individual / proprietor", "Single addressee block"),
-               ("Company + directors", "Company + directors", "Joint & several liability"),
-               ("Partnership + partners", "Partnership firm + partners", "Joint & several liability")]),
-    Q("addr", "Who is it addressed to — full name(s) and address?",
-      ["noticee_name", "noticee_address"], attach=True,
-      ph="e.g. M/s Sharma Tyres, Prop. Mr. Rakesh Sharma, Shop 14, MG Road, Jaipur – 302001. "
-         "For a company, add the company name and each director's name."),
-]
-_SEND = [
-    Q("mode", "How is it going out?", ["mode"], kind="chips",
-      options=[(m, m.title().replace("Whatsapp", "WhatsApp")) for m in MODES]),
-    Q("sig", "Who signs it, and are they currently authorised to sign this type?",
-      ["signatory_name", "signatory_desig", "authority_confirmed"],
-      ph="e.g. Meena Marar, General Manager – Legal — authority confirmed"),
-    Q("ndate", "What date should the notice carry?", ["notice_date"], kind="date"),
-    Q("extra", "Anything else I should factor in?", ["extra_notes"],
-      ph="e.g. prior reminders sent on specific dates, part payments received, "
-         "dealership agreement clause numbers, a shorter demand period"),
-]
-_PRIOR = Q("prior", "Has a notice already gone to this party on this matter?",
-           ["prior", "prior_date", "prior_ref", "current_instrument"],
-           ph="e.g. no. Or: yes, notice dated 02.05.2026 covering cheque 004401 — this one covers only cheque 004512.")
-_JUR = Q("jur", "Where would CEAT file if this isn't resolved?", ["jurisdiction"], kind="text",
-         hint="Left blank, the jurisdiction paragraph is left out entirely — never invented.",
-         ph="e.g. Mumbai")
-
-QUESTIONS: dict[str, list[Q]] = {
-    "s138": _PARTY + [
-        Q("dealing", "What is the dealing — how did the relationship arise?", ["background"],
-          ph="e.g. Appointed as an authorised dealer in 2022 for supply of tyres in the Jaipur territory."),
-        Q("chq", "What are the cheque particulars? Number, date, amount, the bank it was drawn on, and — "
-                 "where several cheques bounced on different days — the return date, reason and memo date "
-                 "for each.",
-          ["cheques"], kind="table", table="cheques", attach=True,
-          ph="e.g. Cheque 004512 dated 12.06.2026 for INR 7,50,400 drawn on HDFC Bank Ltd., Sector 14, Gurugram"),
-        Q("bounce", "If every cheque bounced the same way, say it once here instead: date presented, "
-                    "dishonour date, the exact reason on the memo, and the bank memo date.",
-          ["presented_date", "dishonour_date", "dishonour_reason", "memo_date"], attach=True,
-          hint="Anything left blank here is taken from the cheque table above, row by row.",
-          ph="e.g. Presented 18.06.2026; returned unpaid 20.06.2026 for “Funds Insufficient”; memo dated 20.06.2026"),
-        Q("inv", "Which invoices does the cheque cover? Invoice numbers, dates and amounts.",
-          ["invoices"], attach=True, ph="Invoice no. | date | amount (INR) — one per line"),
-        Q("amt", "Have any part-payments been made since it bounced, and what is the balance now demanded?",
-          ["amount", "part_payment"],
-          ph="e.g. no part-payments; INR 7,50,400 demanded in full"),
-        _JUR, _PRIOR] + _SEND,
-
-    "recovery": _PARTY + [
-        Q("dealing", "What is the dealing — how did the relationship arise?", ["relationship"],
-          ph="e.g. Appointed as an authorised dealer in 2022 for supply of tyres in the Jaipur territory."),
-        Q("soa", "Upload the statement of account or invoice list, or paste the invoice details.",
-          ["soa"], attach=True,
-          ph="invoice/reference no. | document date | outstanding amount — one per line"),
-        Q("total", "What is the total outstanding, and as on what date?", ["amount", "as_on_date"],
-          ph="e.g. INR 8,42,150.00 as on 31.08.2026"),
-        Q("int", "What interest rate should the notice demand?", ["interest"], kind="chips",
-          options=[("8", "8% p.a. (standard)"), ("12", "12% p.a."), ("18", "18% p.a.")]),
-        Q("tax", "Is the outstanding tax-inclusive? If so, the principal and the GST split.",
-          ["principal", "tax"],
-          ph="e.g. principal INR 7,13,686.44 and GST INR 1,28,463.56 — leave blank to omit the paragraph"),
-        _JUR, _PRIOR] + _SEND,
-
-    "consumer": [
-        Q("incoming", "Paste the incoming consumer notice, or attach it.", ["incoming"],
-          attach=True, rows=8,
-          hint="The reply is built against this text paragraph by paragraph.",
-          ph="Paste the complete notice — every numbered paragraph"),
-        Q("who", "Who sent it, and when? Advocate's name, address, and the date on the notice.",
-          ["advocate_name", "advocate_address", "notice_date"], attach=True,
-          ph="e.g. Adv. S. Krishnan, 22 Law Chambers, Chennai – 600104. Notice dated 04.08.2026."),
-        Q("client", "Who is their client, and what did they buy — from whom?",
-          ["client_name", "client_relation", "client_address", "product", "dealer"],
-          ph="e.g. Mr. A. Kumar, owner of vehicle TN-09-AB-1234, Chennai. Bought from Gill Tyre House, not CEAT."),
-        Q("facts", "What are CEAT's own facts? Claim date, inspection finding, what was communicated back.",
-          ["claim_date", "inspection", "rejection"], attach=True,
-          hint="Leave the finding blank rather than assume one — a blank becomes a VERIFY flag.",
-          ph="e.g. claim received 12.05.2026; impact damage, not a manufacturing defect; communicated 20.05.2026"),
-        Q("reply", "How should each paragraph be answered?", ["paras"], kind="table", table="paras"),
-        Q("demands", "What did they demand, and is any of it conceded?", ["demands"],
-          kind="table", table="demands"),
-        Q("rdate", "What date should the reply carry?", ["reply_date"], kind="date"),
-    ] + _SEND[1:],
-
-    "breach": _PARTY + [
-        Q("agr", "Which agreement, and which clause has been breached?",
-          ["agreement_name", "agreement_date", "clause_no"], attach=True,
-          hint="Attach the agreement rather than citing a clause number from memory.",
-          ph="e.g. Dealership Agreement dated 04.03.2025; Clause 7.2 (minimum offtake and payment terms)"),
-        Q("oblig", "What did that clause require them to do?", ["obligation"],
-          ph="e.g. lift a minimum of 400 tyres per quarter and settle invoices within 30 days"),
-        Q("facts", "What actually happened — the factual particulars of the breach?",
-          ["breach_facts"], attach=True,
-          ph="e.g. no orders since 14.02.2026 and January invoices unpaid despite reminders"),
-        Q("cure", "How long should they get to cure it?", ["cure_period"], kind="chips",
-          options=[("7 (SEVEN) days", "7 days"), ("15 (FIFTEEN) days", "15 days"),
-                   ("30 (THIRTY) days", "30 days")]),
-        Q("conseq", "What happens if they don't?", ["consequences"],
-          ph="e.g. terminate the Agreement and initiate proceedings for recovery of dues and losses"),
-        _PRIOR] + _SEND,
-
-    "termination": _PARTY + [
-        Q("agr", "Which agreement is being terminated, what does it govern, and under which clause?",
-          ["agreement_name", "agreement_date", "subject_of", "clause_no"], attach=True,
-          ph="e.g. Dealership Agreement dated 04.03.2025 governing supply in Jaipur; terminable under Clause 12.1"),
-        Q("ground", "On what ground?", ["ground"], kind="chips",
-          options=[("Breach", "Breach"), ("Convenience", "Convenience"), ("Expiry", "Expiry of term")]),
-        Q("detail", "The detail: for a breach, what was required and what happened, with the cure dates. "
-                    "Otherwise the notice period.",
-          ["obligation", "facts", "cure_given_date", "cure_lapsed_date", "notice_period"],
-          ph="e.g. required to clear dues within 30 days; cure notice 02.06.2026, lapsed 17.06.2026, still unpaid"),
-        Q("eff", "Effective from what date?", ["effective_date"], kind="date"),
-        Q("wind", "What must they do on the way out — dues, stock, signage?", ["wind_down", "dues"],
-          ph="e.g. clear dues of INR 3,20,000, return Company property and stock, cease use of CEAT marks"),
-        _PRIOR] + _SEND,
-
-    "renewal": _PARTY + [
-        Q("agr", "Which agreement, when does it expire, and which clause governs renewal?",
-          ["agreement_name", "agreement_date", "expiry_date", "clause_no"], attach=True,
-          ph="e.g. Dealership Agreement dated 04.03.2023, expiring 03.03.2027; Clause 3.2, 60 days' notice"),
-        Q("intent", "Renewing, or not?", ["intent"], kind="chips",
-          options=[("Renew", "Renew"), ("Do not renew", "Do not renew")]),
-        Q("terms", "On what terms, and by when should they confirm? If not renewing, what must they wind down?",
-          ["renewal_term", "revised_terms", "confirm_by", "wind_down", "notice_period"],
-          ph="e.g. a further term of 2 years on existing terms; confirm by 01.02.2027"),
-    ] + _SEND,
-
-    "fm": _PARTY + [
-        Q("agr", "Which agreement, and which force majeure clause?",
-          ["agreement_name", "agreement_date", "clause_no", "direction"], attach=True,
-          ph="e.g. Supply Agreement dated 11.09.2024; force majeure at Clause 14. CEAT is invoking it."),
-        Q("event", "What happened, and when did it start?", ["fm_event", "fm_date"], attach=True,
-          ph="e.g. flooding at the Nashik facility from 10.08.2026 following an evacuation order"),
-        Q("impact", "What can't be performed, for how long, and what is being done about it?",
-          ["affected", "impact", "mitigation"],
-          ph="e.g. despatches suspended; 6–8 weeks; production shifting to Halol"),
-        Q("relief", "What are you asking them to do?", ["relief"],
-          ph="e.g. extend the delivery timelines accordingly"),
-    ] + _SEND,
-
-    "price": _PARTY + [
-        Q("basis", "Under what arrangement, and why is the price changing?",
-          ["agreement_name", "agreement_date", "clause_no", "reason"], attach=True,
-          ph="e.g. Dealership Agreement dated 04.03.2025, Clause 9.3; movement in raw-material costs"),
-        Q("prices", "What are the revised prices? Upload the price list, or list them.",
-          ["prices"], attach=True,
-          ph="product / SKU | existing price | revised price | % change"),
-        Q("eff", "Effective from what date?", ["effective_date"], kind="date"),
-        Q("pre", "What happens to orders already placed before that date?", ["pre_orders"],
-          ph="e.g. honoured at existing prices provided despatch is taken within 30 days"),
-    ] + _SEND,
-}
+def _segs(t: str) -> list[str]:
+    return [s.strip() for s in re.split(r",|\n", str(t or "")) if s.strip()]
 
 
-def label(key: str) -> str:
-    return LABELS.get(key, key.replace("_", " ").capitalize())
+def _quoted(t: str) -> str:
+    m = re.search(r"[“\"']([^”\"']{3,60})[”\"']", str(t or ""))
+    return m.group(1).strip() if m else ""
 
 
-def questions(kind: str) -> list[Q]:
-    return QUESTIONS.get(kind, [])
-
-
-def critical(kind: str) -> list[str]:
-    return CRITICAL.get(kind, [])
-
-
-def is_filled(case: dict, key: str) -> bool:
-    v = case.get(key)
-    if isinstance(v, list):
-        return len(v) > 0
-    return v is not None and str(v).strip() != ""
-
-
-def rows(case: dict, key: str) -> list[dict]:
-    """Table rows for `key`, whatever junk is actually in the slot.
-
-    A table field can briefly hold a raw string (typed into a free-text box
-    before analysis turns it into rows), and nothing downstream should crash
-    on that — it just means no rows yet.
-    """
-    v = case.get(key)
-    return [r for r in v if isinstance(r, dict)] if isinstance(v, list) else []
-
-
-def effective(kind: str, case: dict) -> dict:
-    """A read-only view of the case in which a dishonour fact recorded against
-    every cheque counts as known, even if the single free-text answer is empty.
-
-    Without this, three cheques each carrying their own return date would still
-    read as “bank memo date missing” and block the draft.
-    """
-    if kind != "s138":
-        return case
-    chq = rows(case, "cheques")
-    if not chq:
-        return case
-    out = dict(case)
-    for col, key in CHQ_ROLLUP.items():
-        vals = [str(r.get(col, "")).strip() for r in chq]
-        if not all(vals):
+def _dates_by_cue(text: str, cues: dict[str, str]) -> dict[str, str]:
+    """Map each date in the text to a field, by the words just before it."""
+    t = str(text or "")
+    out: dict[str, str] = {}
+    for m in re.finditer(r"\b(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\.?\s+\d{4})\b", t):
+        d = parse_date(m.group(1))
+        if not d:
             continue
-        uniq = list(dict.fromkeys(vals))
-        out[f"_{key}_perrow"] = True
-        out[f"_{key}_uniform"] = len(uniq) == 1
-        if not str(out.get(key, "")).strip():
-            out[key] = uniq[0] if len(uniq) == 1 else "; ".join(uniq)
+        lead = t[max(0, m.start() - 55):m.start()].lower()
+        for field, pattern in cues.items():
+            if field in out:
+                continue
+            if re.search(pattern, lead):
+                out[field] = d.isoformat()
+                break
     return out
+
+
+def _after(text: str, pattern: str, stop: str = r"[.;\n]") -> str:
+    m = re.search(pattern + r"\s*[:\-–—]?\s*(.+?)(?=" + stop + r"|$)", str(text or ""), re.I | re.S)
+    return re.sub(r"\s+", " ", m.group(1)).strip(" ,;") if m else ""
+
+
+def _split_party(parts: list[str]) -> tuple[str, str]:
+    """(addressee, proprietorship concern) — whichever part names a person is
+    the addressee and whichever names a concern is the concern, regardless of
+    which one carried the word "Proprietor"."""
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return (parts[0] if parts else ""), ""
+    person = next((p for p in parts if PERSON.search(p)), "")
+    firm = next((p for p in parts if FIRMY.search(p) and p != person), "")
+    if not person and firm:                      # no honorific — whatever is not
+        person = next((p for p in parts if p != firm), "")   # the concern is the person
+    if person and firm:
+        return person, firm
+    return parts[0], ", ".join(parts[1:])
+
+
+def _name_and_address(raw: str) -> tuple[str, str, str]:
+    """(name, proprietorship concern, address) out of one typed block."""
+    ls = _lines(raw)
+    if len(ls) >= 2:
+        head, rest = ls[0], ls[1:]
+        marked = ""
+        if rest and PROP.match(rest[0]):
+            marked = PROP.sub("", rest[0]).strip()
+            rest = rest[1:]
+        name, firm = _split_party([head, marked])
+        return name, firm, "\n".join(rest)
+
+    segs = _segs(raw)
+    if not segs:
+        return "", "", ""
+    cut = next((i for i, s in enumerate(segs) if ADDR_START.match(s)), None)
+    if cut is None or cut == 0:
+        cut = 1 if len(segs) > 1 else len(segs)
+    head_parts, tail = segs[:cut], segs[cut:]
+    name, firm = _split_party([PROP.sub("", s).strip() for s in head_parts])
+    return name, firm, ", ".join(tail)
+
+
+def _rows_from_lines(raw: str, cols: list[str]) -> list[dict]:
+    """'INV-1 | 02.05.2026 | 150000' one per line -> table rows."""
+    out = []
+    for line in _lines(raw):
+        parts = [p.strip() for p in re.split(r"\s*\|\s*|\t+|\s{2,}|,", line) if p.strip()]
+        if len(parts) < 2:
+            continue
+        row = {c: "" for c in cols}
+        for p in parts:
+            d, a = parse_date(p), find_amounts("INR " + p)
+            if d and "date" in row and not row["date"]:
+                row["date"] = d.isoformat()
+            elif re.fullmatch(r"[\d,]+(?:\.\d{1,2})?", p) and "amt" in row and not row["amt"]:
+                row["amt"] = re.sub(r"[^\d.]", "", p)
+            else:
+                for c in cols:
+                    if c in ("ref", "no", "sku") and not row[c]:
+                        row[c] = p
+                        break
+        if any(row.values()):
+            out.append(row)
+    return out if len(out) >= 1 and any(r.get("amt") or r.get("date") for r in out) else []
+
+
+# ------------------------------------------------------------------ rules --
+def _parse(kind: str, qid: str, raw: str, case: dict) -> dict:
+    t = str(raw or "").strip()
+    if not t:
+        return {}
+    v: dict = {}
+    low = t.lower()
+
+    if qid == "addr":
+        name, firm, addr = _name_and_address(t)
+        if name:
+            v["noticee_name"] = name
+        if firm:
+            v["firm_name"] = firm
+        if addr:
+            v["noticee_address"] = addr
+
+    elif qid == "chq":
+        # There was no branch here at all: cheque number, date, amount and bank
+        # came only from the model, so a garbled model reply had nothing to fall
+        # back to and printed straight into the notice.
+        chq = _cheques(t)
+        if chq:
+            v["cheques"] = chq
+        v.update(_dates_by_cue(t, {
+            "presented_date": r"present",
+            "memo_date": r"memo|intimation|advice|slip",
+            "dishonour_date": r"return|dishonour|dishonor|unpaid|bounce",
+        }))
+        reason = _quoted(t) or _after(t, r"\b(?:for the reason|reason|reasons?)\b", r"[.;\n]|vide")
+        if reason:
+            v["dishonour_reason"] = reason.strip(" ,;")
+
+    elif qid == "bounce":
+        v.update(_dates_by_cue(t, {
+            "presented_date": r"present",
+            "memo_date": r"memo|intimation|advice|slip",
+            "dishonour_date": r"return|dishonour|dishonor|unpaid|bounce",
+        }))
+        ds = find_dates(t)
+        if ds and "dishonour_date" not in v:
+            v["dishonour_date"] = ds[0]
+        reason = _quoted(t) or _after(t, r"\b(?:for the reason|reason|reasons?)\b", r"[.;\n]|vide")
+        if reason:
+            v["dishonour_reason"] = reason.strip(" ,;")
+
+    elif qid == "amt":
+        amts = find_amounts(t)
+        if amts:
+            near = re.search(r"(?:demand(?:ed)?|balance|payable|outstanding|due)[^\d]{0,24}"
+                             r"(?:INR|Rs\.?|₹)?\s*([\d,]+(?:\.\d{1,2})?)", t, re.I)
+            v["amount"] = (re.sub(r"[^\d.]", "", near.group(1)) if near else str(max(amts)))
+        if re.search(r"\bpart[- ]?pay", low) and not re.search(
+                r"\b(?:no|none|nil|without any)\b[^.]{0,24}part[- ]?pay", low):
+            v["part_payment"] = t
+
+    elif qid == "total":
+        amts = find_amounts(t)
+        if amts:
+            v["amount"] = str(max(amts))
+        d = _dates_by_cue(t, {"as_on_date": r"as on|as at|as of|upto|up to"})
+        if d:
+            v.update(d)
+        elif find_dates(t):
+            v["as_on_date"] = find_dates(t)[0]
+
+    elif qid == "tax":
+        p = re.search(r"principal[^\d]{0,20}([\d,]+(?:\.\d{1,2})?)", t, re.I)
+        g = re.search(r"(?:gst|tax|igst|cgst)[^\d]{0,20}([\d,]+(?:\.\d{1,2})?)", t, re.I)
+        if p:
+            v["principal"] = re.sub(r"[^\d.]", "", p.group(1))
+        if g:
+            v["tax"] = re.sub(r"[^\d.]", "", g.group(1))
+
+    elif qid == "sig":
+        segs = _segs(t.replace("—", ",").replace(" - ", ", "))
+        if segs:
+            v["signatory_name"] = segs[0]
+        desig = next((s for s in segs[1:] if ROLE.search(s)), "")
+        if desig:
+            v["signatory_desig"] = desig
+        if re.search(r"authorit(?:y|ies)\s+confirm|confirmed\s+authorit|is\s+authoris|is\s+authoriz",
+                     low) and not re.search(r"\bnot\b[^.]{0,20}authoris", low):
+            v["authority_confirmed"] = True
+
+    elif qid == "prior":
+        if re.match(r"\s*(?:no\b|none\b|nil\b)", low):
+            v["prior"] = "No"
+        elif re.match(r"\s*(?:yes\b|y\b)", low):
+            v["prior"] = "Yes"
+            ds = find_dates(t)
+            if ds:
+                v["prior_date"] = ds[0]
+            ref = _after(t, r"\b(?:covering|regarding|in respect of|re)\b")
+            if ref:
+                v["prior_ref"] = ref
+            cur = _after(t, r"\bthis (?:one|notice) covers only\b")
+            if cur:
+                v["current_instrument"] = cur
+        elif re.search(r"don'?t know|unsure|not sure|unknown", low):
+            v["prior"] = "Don't know"
+
+    elif qid == "inv":
+        # Pipe/tab/two-space columns first; prose such as "Tax Invoice No. X
+        # dated D for INR A" falls through to the cue-anchored reader, which
+        # does not split an Indian-format amount on its own commas.
+        rows = _rows_from_lines(t, ["no", "date", "amt"]) or _invoices(t)
+        if rows:
+            v["invoices"] = rows
+
+    elif qid == "soa":
+        rows = _rows_from_lines(t, ["ref", "date", "amt"])
+        if rows:
+            v["soa"] = rows
+
+    elif qid == "who":                                   # consumer: the advocate
+        segs = _segs(t)
+        if segs:
+            v["advocate_name"] = segs[0]
+            rest = [s for s in segs[1:] if not re.search(r"notice dated|dated", s, re.I)]
+            if rest:
+                v["advocate_address"] = ", ".join(rest)
+        ds = find_dates(t)
+        if ds:
+            v["notice_date"] = ds[-1]
+
+    elif qid == "client":
+        segs = _segs(t)
+        if segs:
+            # "Mr Prakash Desai bought CEAT tyres from ..." — the name ends at
+            # the verb. Trim the NAME only; the full text still feeds the
+            # dealer and product parsers below.
+            v["client_name"] = re.sub(
+                r"\s+\b(?:bought|purchased|acquired|has|had)\b.*$", "", segs[0], flags=re.I | re.S
+            ).strip(" ,;")
+        rel = next((s for s in segs[1:] if re.search(r"owner|driver|purchaser|user|consumer", s, re.I)), "")
+        if rel:
+            v["client_relation"] = rel
+        prod = _after(t, r"\b(?:bought|purchased)\b", r"\bfrom\b|[.;\n]")
+        if prod:
+            v["product"] = prod
+        dealer = _after(t, r"\bfrom\b")
+        if dealer:
+            d = re.sub(r"^(?:m/s\s+)?", "", dealer, flags=re.I)
+            # drop the invoice tail: "... , vide Tax Invoice No. STW/2026/1184"
+            d = re.split(r"\s*,?\s*\b(?:vide|vide\s+invoice|invoice\s+no)\b", d, flags=re.I)[0]
+            v["dealer"] = d.strip(" ,;")
+        addr = next((s for s in segs[1:] if ADDR_START.match(s)), "")
+        if addr:
+            v["client_address"] = addr
+
+    elif qid == "facts":                                 # consumer: CEAT's own facts
+        d = _dates_by_cue(t, {"claim_date": r"claim|received|lodg",
+                              "rejection": r"communicat|inform|convey|reject"})
+        v.update(d)
+        ins = _after(t, r"\b(?:on inspection|inspection|found to be|found)\b", r"[.;\n]|, and")
+        if ins:
+            v["inspection"] = ins
+
+    elif qid == "agr":                                   # breach / termination / renewal / fm / price
+        head = re.split(r"\bdated\b", t, 1, flags=re.I)[0]
+        head = _segs(head)
+        if head:
+            v["agreement_name"] = head[0]
+        ds = find_dates(t)
+        if ds:
+            v["agreement_date"] = ds[0]
+            if kind == "renewal" and len(ds) > 1:
+                v["expiry_date"] = ds[1]
+        cl = re.search(r"clause\s*(?:no\.?)?\s*([0-9]+(?:\.[0-9]+)*[A-Za-z]?)", t, re.I)
+        if cl:
+            v["clause_no"] = cl.group(1)
+        if kind == "fm":
+            if re.search(r"\bceat\b[^.]{0,40}\binvok", t, re.I):
+                v["direction"] = "Invoking"
+            elif re.search(r"\brespond", t, re.I):
+                v["direction"] = "Responding"
+
+    elif qid == "basis":                                 # price adjustment
+        ds = find_dates(t)
+        if ds:
+            v["agreement_date"] = ds[0]
+        head = _segs(re.split(r"\bdated\b", t, 1, flags=re.I)[0])
+        if head:
+            v["agreement_name"] = head[0]
+        cl = re.search(r"clause\s*(?:no\.?)?\s*([0-9]+(?:\.[0-9]+)*[A-Za-z]?)", t, re.I)
+        if cl:
+            v["clause_no"] = cl.group(1)
+        reason = _after(t, r"\b(?:on account of|because of|due to|owing to|reason)\b")
+        if reason:
+            v["reason"] = reason
+
+    elif qid == "event":                                 # force majeure
+        ds = find_dates(t)
+        if ds:
+            v["fm_date"] = ds[0]
+        v["fm_event"] = re.sub(r"\s+", " ", t).strip()
+
+    elif qid == "detail" and kind == "termination":
+        v.update(_dates_by_cue(t, {"cure_given_date": r"cure (?:notice|period) (?:given|issued|sent)|cure notice",
+                                   "cure_lapsed_date": r"laps|expir|end(?:ed)?"}))
+
+    elif qid == "prices":
+        rows = _rows_from_lines(t, ["sku", "old", "nw"])
+        if rows:
+            v["prices"] = rows
+
+    return {k: x for k, x in v.items() if x not in ("", None, [], {})}
+
+
+# ------------------------------------------------------- the whole story --
+DATE_RX = r"\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\.?\s+\d{4}"
+MONEY_RX = r"[\d][\d,]*(?:\.\d{1,2})?"
+
+
+def _d(s):
+    d = parse_date(s)
+    return d.isoformat() if d else ""
+
+
+def _money(s):
+    v = re.sub(r"[^\d.]", "", str(s or ""))
+    return v if v not in ("", ".") else ""
+
+
+def _cheques(t: str) -> list[dict]:
+    """Cheque particulars out of a narrative. The phrasing is stereotyped —
+    'cheque no. X dated D for INR A drawn on B, dishonoured E for "reason"' —
+    so each mention is read as its own block, inheriting 'same bank'."""
+    out: list[dict] = []
+    parts = re.split(r"(?i)\bcheque\b", t)[1:]
+    for raw in parts:
+        ch = raw[:420]
+        no = re.search(r"(?:no\.?|number|bearing)\s*:?\s*([0-9]{4,12})", ch, re.I) \
+            or re.search(r"^[\s:,.#-]*([0-9]{4,12})\b", ch)
+        if not no:
+            continue
+        row = {c: "" for c, _ in (("no", 0), ("date", 0), ("amt", 0), ("bank", 0),
+                                  ("dis", 0), ("reason", 0), ("memo", 0))}
+        row["no"] = no.group(1)
+        m = re.search(r"dated\s+(" + DATE_RX + r")", ch, re.I)
+        row["date"] = _d(m.group(1)) if m else ""
+        m = (re.search(r"(?:for|of|amounting to|sum of)\s*(?:INR|Rs\.?|₹)\s*(" + MONEY_RX + r")", ch, re.I)
+             or re.search(r"(?:INR|Rs\.?|₹)\s*(" + MONEY_RX + r")", ch, re.I)
+             or re.search(r",\s*(\d[\d,]{4,})\s*,", ch))
+        row["amt"] = _money(m.group(1)) if m else ""
+        # The stop-cue list matters: without "issued" the bank field runs on
+        # into ", issued by Noticee No" and only stops at the period in "No.".
+        m = re.search(r"drawn on\s+(.+?)"
+                      r"(?=,?\s*(?:dishonou?r|returned|reason|memo|issued|signed|drawn|"
+                      r"bearing|payable|in favour|under the signature)|[.;]|$)", ch, re.I)
+        if m:
+            row["bank"] = m.group(1).strip(" ,")
+        elif re.search(r"same bank", ch, re.I) and out:
+            row["bank"] = out[-1]["bank"]
+        m = re.search(r"(?:dishonou?red|returned(?:\s+unpaid)?)\s*(?:on\s+)?(" + DATE_RX + r")", ch, re.I)
+        row["dis"] = _d(m.group(1)) if m else ""
+        r_ = _quoted(ch) or _after(ch, r"\breasons?\b", r"[.;\n]|,\s*cheque")
+        row["reason"] = r_.strip(" ,;'\"")
+        m = re.search(r"memo\s+(?:dated\s+)?(" + DATE_RX + r")", ch, re.I)
+        row["memo"] = _d(m.group(1)) if m else ""
+        if row["no"] and (row["amt"] or row["date"]):
+            out.append(row)
+    return out
+
+
+# --------------------------------------------------- invoices / directors --
+# The number cue below is REQUIRED. Without it the alternation backtracks from
+# "invoice" to "inv" on prose such as "Which invoices does the cheque cover?"
+# and the capture group swallows the leftover "oices" as an invoice number.
+INV_RX = re.compile(r"(?:invoices?|inv|bill)\s*(?:no\.?|number|#)\s*[:\-]?\s*"
+                    r"([A-Z0-9][A-Z0-9/\-]{3,24})", re.I)
+
+PERSON_NAME = (r"(?:Mr|Mrs|Ms|Shri|Smt|Sri|Dr|Miss)\.?\s+"
+               r"[A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){0,3}")
+
+
+def _invoices(t: str) -> list[dict]:
+    """Invoice rows out of a narrative or a pasted sheet.
+
+    Line-scoped on purpose: the date and the amount are taken from the same
+    line that carries the invoice number, never from the first date or the
+    first amount found anywhere in the file.
+    """
+    out, seen = [], set()
+    for line in str(t or "").splitlines():
+        m = INV_RX.search(line)
+        if not m:
+            continue
+        no = m.group(1).strip(" .,;:")
+        if not no or no.lower() in seen:
+            continue
+        seen.add(no.lower())
+        tail = line[m.end():]
+        dm = (re.search(r"dated?\s+(" + DATE_RX + r")", tail, re.I)
+              or re.search(r"(" + DATE_RX + r")", tail))
+        am = (re.search(r"(?:for|of|amounting to|sum of)\s*(?:INR|Rs\.?|\u20b9)\s*("
+                        + MONEY_RX + r")", tail, re.I)
+              or re.search(r"(?:INR|Rs\.?|\u20b9)\s*(" + MONEY_RX + r")", tail, re.I))
+        row = dict(no=no,
+                   date=_d(dm.group(1)) if dm else "",
+                   amt=_money(am.group(1)) if am else "")
+        if row["date"] or row["amt"]:
+            out.append(row)
+    return out
+
+
+def _directors(t: str, default_addr: str = "") -> list[dict]:
+    """Directors named as co-noticees. Only lines that actually say 'director'
+    are read, so an authorised signatory mentioned elsewhere is not promoted
+    into a noticee. 'same address' inherits the company's address."""
+    out, seen = [], set()
+    for line in str(t or "").splitlines():
+        if not re.search(r"\bdirectors?\b|\bpartners?\b", line, re.I):
+            continue
+        for m in re.finditer(PERSON_NAME, line):
+            name = re.sub(r"\s+", " ", m.group(0)).strip(" ,.")
+            if len(name.split()) < 2 or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            tail = line[m.end():]
+            if re.search(r"\bsame address\b", tail, re.I):
+                addr = default_addr
+            else:
+                am = re.search(r"\baddress(?:ed at)?\b\s*[:\-]?\s*(.+?)[.;]*$", tail, re.I)
+                addr = am.group(1).strip(" ,.") if am else ""
+            out.append(dict(name=name, address=addr))
+    return out
+
+
+def _noticee_type(t: str) -> str:
+    """Company or proprietorship. Read wherever the party is described — a
+    private limited company must never fall through to the proprietorship
+    wording just because the choice widget was left untouched."""
+    t = str(t or "")
+    if re.search(r"\bpartnership\s+firm\b|\bpartnership\s+act\b|\bpartners?\b", t, re.I):
+        return "Partnership + partners"
+    if re.search(r"\b(?:sole|individual)\s+propriet|\bproprietorship\b", t, re.I):
+        return "Individual / sole proprietor"
+    if re.search(r"\bdirectors?\b|\bpvt\.?\s*ltd\b|\bprivate limited\b|"
+                 r"\blimited\b|\bllp\b", t, re.I):
+        return "Company + directors"
+    return ""
+
+
+
+def narrative(kind: str, text: str) -> tuple[dict, dict, list]:
+    """Read a single free-form account of the matter — the way you would brief
+    a colleague — into fields. Cue-anchored only: a value is taken because the
+    text names it ("drawn on", "as on", "dishonoured"), never because of where
+    it happens to sit. What is not clearly marked stays empty.
+    """
+    t = str(text or "").strip()
+    if not t:
+        return {}, {}, []
+    v, ev, notes = {}, {}, []
+    E = "read from the account you gave"
+
+    def put(k, val, why=E):
+        if val not in ("", None, [], {}) and k not in v:
+            v[k] = val
+            ev[k] = why
+
+    # who
+    put("noticee_type", _noticee_type(t))
+
+    # A label with a delimiter, so "…from the same drawer." is not mistaken for
+    # "Drawer: Om Enterprises".
+    mw = re.search(r"\b(?:drawer|noticee|addressee|addressed to|party|dealer)\b\s*[:\-–—]\s*"
+                   r"(.+?)(?=[.;\n]|,\s*address)", t, re.I)
+    who = mw.group(1).strip(" ,") if mw else ""
+    if who:
+        inner = re.search(r"\(([^)]*(?:propriet|director)[^)]*)\)", who, re.I)
+        person = ""
+        if inner:
+            person = re.sub(r"(?i)\b(?:individual|sole)?\s*(?:propriet(?:or|orship)|director)\b[:,\s]*",
+                            "", inner.group(1)).strip()
+            who = who[:inner.start()].strip(" ,")
+        name, firm = _split_party([who, person] if person else [who])
+        put("noticee_name", name)
+        put("firm_name", firm)
+    addr = _after(t, r"\baddress(?:ed at)?\b", r"[.;\n]")
+    put("noticee_address", addr)
+    if str(v.get("noticee_type", "")).startswith("Company"):
+        dirs = _directors(t, v.get("noticee_address", ""))
+        if dirs:
+            put("directors", dirs, f"{len(dirs)} director(s) named in the account you gave")
+
+    # the instruments
+    if kind == "s138":
+        inv = _invoices(t)
+        if inv:
+            put("invoices", inv, f"{len(inv)} invoice(s) described in the account you gave")
+        chq = _cheques(t)
+        if chq:
+            put("cheques", chq, f"{len(chq)} cheque(s) described in the account you gave")
+            for col, key in (("dis", "dishonour_date"), ("reason", "dishonour_reason"),
+                             ("memo", "memo_date")):
+                vals = {c[col] for c in chq if c[col]}
+                if len(vals) == 1 and len(chq) == 1:
+                    put(key, vals.pop())
+
+    # money
+    m = re.search(r"(?:total|aggregat\w+|demanded|outstanding|due|balance|sum of)\D{0,26}"
+                  r"(?:INR|Rs\.?|₹)\s*(" + MONEY_RX + r")", t, re.I)
+    if m:
+        put("amount", _money(m.group(1)))
+    elif kind == "s138" and v.get("cheques"):
+        tot = sum(float(c["amt"]) for c in v["cheques"] if c["amt"])
+        if tot:
+            put("amount", str(tot), f"sum of the {len(v['cheques'])} cheques you described")
+            notes.append("No separate demand figure was stated, so the amount demanded was taken "
+                         "as the total of the cheques described. Confirm it before issue.")
+
+    m = re.search(r"as on\s+(" + DATE_RX + r")", t, re.I)
+    if m:
+        put("as_on_date", _d(m.group(1)))
+    m = re.search(r"@\s*(\d+(?:\.\d+)?)\s*%", t)
+    if m:
+        put("interest", m.group(1))
+    if re.search(r"\bno\b[^.]{0,30}part[- ]?pay|without any part[- ]?pay", t, re.I):
+        pass                                  # explicitly none — leave the field empty
+    elif re.search(r"part[- ]?pay", t, re.I):
+        put("part_payment", _after(t, r"[^.]*part[- ]?pay", r"[.;\n]") or t)
+
+    # how it goes out, and who signs
+    for mode in ("hand delivery", "speed post", "courier", "whatsapp", "email"):
+        if re.search(r"\b" + mode.replace(" ", r"\s+") + r"\b", t, re.I):
+            put("mode", "BY " + mode.upper())
+            break
+    # Not _after(): "Mr. A. Verma" is full of full stops, so the line runs to
+    # the end of the line and the trailing stop is trimmed afterwards.
+    ms = re.search(r"\b(?:signator(?:y|ies)|signed by|to be signed by)\b\s*[:\-–—]?\s*([^\n]+)",
+                   t, re.I)
+    sig = ms.group(1).strip().rstrip(".").strip() if ms else ""
+    if sig:
+        segs = _segs(sig.replace("—", ",").replace(" - ", ", "))
+        if segs:
+            put("signatory_name", segs[0])
+        d = next((s for s in segs[1:] if ROLE.search(s)), "")
+        put("signatory_desig", d)
+
+    # agreements, for the contract notice types
+    m = re.search(r"clause\s*(?:no\.?)?\s*([0-9]+(?:\.[0-9]+)*[A-Za-z]?)", t, re.I)
+    if m:
+        put("clause_no", m.group(1))
+    m = re.search(r"\b(\w[\w\s]{2,40}?agreement)\s+dated\s+(" + DATE_RX + r")", t, re.I)
+    if m:
+        put("agreement_name", m.group(1).strip().title())
+        put("agreement_date", _d(m.group(2)))
+    m = re.search(r"jurisdiction\D{0,18}\b(?:at|of|in)\s+([A-Z][A-Za-z]+)", t)
+    if m:
+        put("jurisdiction", m.group(1))
+
+    return v, ev, notes
+
+
+def from_text(kind: str, case: dict) -> tuple[dict, dict]:
+    """(values, evidence) read out of the free-text answers already in `case`."""
+    values, evidence = {}, {}
+    for key, raw in list(case.items()):
+        if not key.startswith("_raw_") or not str(raw or "").strip():
+            continue
+        qid = key[len("_raw_"):]
+        try:
+            got = _parse(kind, qid, raw, case)
+        except Exception:                     # a parser must never break the run
+            continue
+        for k, val in got.items():
+            values.setdefault(k, val)
+            evidence.setdefault(k, "read from what you typed")
+    return values, evidence
