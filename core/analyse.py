@@ -534,6 +534,36 @@ def _fix_noticees(case: dict, found: Found) -> Found:
     return found
 
 
+def _prefer_filtered_rows(base: Found, merged: Found, case: dict) -> Found:
+    """If the model returned a whole ledger, keep the deterministic filtered read.
+
+    The prompt tells the model to keep only this counterparty's rows. Telling it
+    is not the same as enforcing it — when it returns the lot, the validator
+    stops the draft and the user is left stuck. The deterministic reader has
+    already filtered on the party column, so where its row set is dramatically
+    smaller, it is the trustworthy one and is put back.
+    """
+    for key in ("soa", "invoices"):
+        m_rows = merged.values.get(key) or []
+        b_rows = base.values.get(key) or []
+        if not isinstance(m_rows, list) or not isinstance(b_rows, list):
+            continue
+        if len(m_rows) > 40 and b_rows and len(b_rows) * 3 < len(m_rows):
+            merged.values[key] = b_rows
+            if base.evidence.get(key):
+                merged.evidence[key] = base.evidence[key]
+            # The total must follow the rows it is supposed to sum.
+            if base.values.get("amount") is not None:
+                merged.values["amount"] = base.values["amount"]
+                if base.evidence.get("amount"):
+                    merged.evidence["amount"] = base.evidence["amount"]
+            merged.notes.append(
+                f"The model returned {len(m_rows)} rows for “{key}” — the whole ledger rather than "
+                f"{case.get('noticee_name') or 'this counterparty'}'s rows. The filtered reading of "
+                f"{len(b_rows)} row(s) was used instead.")
+    return merged
+
+
 # --------------------------------------------------------------------------
 def analyse(kind: str, case: dict, docs: list[Doc]) -> Found:
     """Model first when a key is present, deterministic reader as the floor.
@@ -612,4 +642,4 @@ def analyse(kind: str, case: dict, docs: list[Doc]) -> Found:
                 merged.evidence[k] = got.evidence[k]
         merged.missing += [m for m in got.missing if m not in merged.missing]
         merged.notes += [n for n in got.notes if n not in merged.notes]
-    return _fix_noticees(case, with_typed(merged))
+    return _fix_noticees(case, with_typed(_prefer_filtered_rows(base, merged, case)))
