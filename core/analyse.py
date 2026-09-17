@@ -32,7 +32,6 @@ class Found:
     notes: list = field(default_factory=list)
     used_model: bool = False
     error: str = ""
-    filtered: bool = False          # table rows were narrowed to the named party
 
 
 # --------------------------------------------------------------------------
@@ -55,7 +54,6 @@ def _prompt(kind: str, case: dict, docs: list[Doc]) -> str:
     documents = "\n\n".join(doc_blocks) or "(no readable documents attached)"
 
     cols = {t: [c[0] for c in TABLE_COLS[t]] for t in TABLE_COLS}
-    party = " / ".join(f"“{n}”" for n in _party_names(case)) or "(not yet named)"
 
     return f"""You are the analysis step of CEAT Limited's legal notice drafting console.
 You are preparing a {SK.notice_ref(kind).kind} — {ref.when_to_use or kind}.
@@ -75,14 +73,9 @@ THE ATTACHED DOCUMENTS:
 
 YOUR TASK
 Work out for yourself which sheet, which header row, which columns and which rows
-matter. Read every document. Then return the values you actually found.
-
-ONE PARTY ONLY. This notice goes to one noticee: {party}.
-A ledger may list many dealers. Return table rows, the amount and the as-on date
-for THAT party alone — never every row in the sheet, and never a grand total of
-all parties. Ignore "Total" / "Grand Total" lines. If no noticee is named and the
-documents cover several parties, return no table rows and no amount, and put
-"which party this notice is addressed to" in "missing".
+matter. Use what the user told you to find the right material — if they named the
+dealer, keep only that dealer's rows and ignore the others. Read every document.
+Then return the values you actually found.
 
 ABSOLUTE CONSTRAINTS
 - Never invent, round, estimate or infer a value that is not supported by the user's
@@ -91,6 +84,24 @@ ABSOLUTE CONSTRAINTS
 - Do not overwrite anything already present in the user's input above.
 - Amounts: digits only, no commas or currency symbols. Dates: YYYY-MM-DD.
 - For a total you computed by summing rows, say so in "evidence".
+
+READING A LEDGER, AGEING REPORT OR STATEMENT
+A file of this kind usually covers MANY counterparties. This notice concerns ONE.
+- Keep only the rows whose party/customer/dealer column matches this notice's
+  counterparty. Match on the substance of the name, not character-for-character:
+  "M/s Highway Auto Spares Pvt Ltd" and "M/s Highway Auto Spares Private Limited"
+  are the same party. Every other row belongs to a different customer and must not
+  appear, be summed, or influence any figure.
+- Putting another customer's rows into this notice discloses their data to a third
+  party. Treat it as a hard error, not an untidiness.
+- Where both an invoice-value column and an outstanding/balance column exist, the
+  amount demanded is the OUTSTANDING/BALANCE column. Invoice value is what was
+  billed; balance is what is still owed after payments. Never sum invoice value
+  when a balance column is present.
+- The total you return must equal the sum of the rows you return in the table. If
+  they cannot be reconciled, omit the total and say so in "missing".
+- In "evidence" for the total, state the counterparty filtered on, the column summed
+  and the number of rows — e.g. "AR ageing, Highway Auto Spares, Balance O/s, 5 rows".
 
 RETURN ONLY JSON, no prose, exactly this shape:
 {{
@@ -222,15 +233,23 @@ def _sniff(header: list, body: list[list]) -> dict:
         ref=["invoice", "inv", "bill", "ref", "document", "doc", "voucher"],
         party=["party", "dealer", "customer", "name", "account", "ledger", "distributor"],
     )
+    # What is still owed beats what was billed. A ledger carrying both an
+    # "Invoice Amt" and a "Balance O/s" column must be summed on the balance.
+    owed = ["outstanding", "balance", "o/s", "os", "closing", "unpaid"]
+    billed = ["invoice amt", "invoice amount", "invoice value", "gross", "billed"]
     tests = dict(date=_looks_date, amt=_looks_money, ref=lambda v: bool(re.search(r"\d", str(v))),
-                 # a name, not a code: "INV-1001" has letters too, but a digit gives it away
-                 party=lambda v: bool(re.search(r"[A-Za-z]{3,}", str(v))) and not re.search(r"\d", str(v)))
+                 party=lambda v: bool(re.search(r"[A-Za-z]{3,}", str(v))) and not _looks_money(v))
     for role, words in hints.items():
         best, best_s = -1, 0.0
         for c in range(n):
-            h = re.sub(r"[^a-z ]", " ", str(header[c]).lower())
+            h = re.sub(r"[^a-z /]", " ", str(header[c]).lower())
             vals = [r[c] for r in body if c < len(r) and str(r[c]).strip()]
             hit = 3.0 if any(w in h for w in words) else 0.0
+            if role == "amt" and hit:
+                if any(w in h for w in owed):
+                    hit += 2.5          # prefer the balance column
+                elif any(w in h for w in billed):
+                    hit -= 1.5          # demote gross invoice value
             frac = (sum(1 for v in vals if tests[role](v)) / len(vals)) * 2 if vals else 0
             if hit + frac > best_s:
                 best, best_s = c, hit + frac
@@ -239,102 +258,23 @@ def _sniff(header: list, body: list[list]) -> dict:
 
 
 def _tokens(s: str) -> list[str]:
+    # Constitution words carry no identity, and neither do the trade words that
+    # half the dealers in a tyre ledger share. Matching on "auto" or "spares"
+    # pulls in every other dealer; matching on "highway" finds the right one.
     stop = {"the", "and", "ltd", "limited", "pvt", "private", "mrs", "shri", "prop",
-            "proprietor", "company", "messrs", "smt", "sri", "miss"}
-    out = []
-    for w in re.sub(r"[^a-z0-9]+", " ", str(s).lower()).split():
-        if len(w) > 2 and w not in stop:
-            out.append(w[:-1] if len(w) > 4 and w.endswith("s") else w)   # tyres ~ tyre
-    return out
-
-
-# Words half the dealer network shares. "Sharma Tyres" must not pull in
-# "Gupta Tyres" just because both contain "tyres".
-_GENERIC = {"tyre", "tire", "trader", "trading", "enterprise", "motor", "auto", "automobile",
-            "agency", "agencie", "store", "son", "corporation", "corp", "industrie", "industry",
-            "house", "centre", "center", "mart", "sale", "service", "distributor", "dealer",
-            "group", "point", "zone", "india", "wheel", "associate", "brother", "bro", "co"}
-
-_TOTAL_ROW = re.compile(r"^\s*(?:grand\s*|sub\s*-?\s*)?total\b", re.I)
-
-
-def _is_total_row(r: list) -> bool:
-    return any(_TOTAL_ROW.match(str(c)) for c in r if str(c).strip() and not _looks_money(c))
-
-
-def _party_names(case: dict) -> list[str]:
-    seen, out = set(), []
-    for k in ("firm_name", "noticee_name", "client_name"):
-        v = str(case.get(k) or "").strip()
-        if v and v.lower() not in seen:
-            seen.add(v.lower())
-            out.append(v)
-    return out
-
-
-def _match_score(names: list[str], cell: str) -> float:
-    """1.0 = every word of a name is in the cell. 0 = not this party.
-    Every distinctive word must be present; generic words only break ties."""
-    have = set(_tokens(cell))
-    best = 0.0
-    for n in names:
-        toks = _tokens(n)
-        if not toks:
-            continue
-        key = [t for t in toks if t not in _GENERIC] or toks
-        if all(t in have for t in key):
-            best = max(best, sum(1 for t in toks if t in have) / len(toks))
-    return best
-
-
-def _pick_party_rows(dname: str, sheet: str, body: list[list], pcol: int,
-                     case: dict) -> tuple[list[list] | None, list[str], bool]:
-    """(rows to use or None to take nothing, notes, filtered_to_a_named_party)."""
-    names = _party_names(case)
-    label_ = f"{dname}, sheet “{sheet}”"
-
-    def cell(r):
-        if 0 <= pcol < len(r):
-            return str(r[pcol])
-        return " ".join(str(c) for c in r if not _looks_money(c))
-
-    if names:
-        scored = [(_match_score(names, cell(r)), r) for r in body]
-        top = max((sc for sc, _ in scored), default=0.0)
-        if top > 0:
-            hits = [r for sc, r in scored if sc == top]
-            notes = []
-            if len(hits) < len(body):
-                notes.append(f"{label_}: kept {len(hits)} of {len(body)} rows for “{names[0]}”.")
-            if pcol >= 0:
-                variants = sorted({str(r[pcol]).strip() for r in hits if pcol < len(r)})
-                if len(variants) > 1:
-                    notes.append(f"{label_}: the kept rows carry {len(variants)} different party "
-                                 f"names ({'; '.join(variants[:5])}) — confirm they are one party.")
-            return hits, notes, True
-        if pcol >= 0:
-            parties = list(dict.fromkeys(str(r[pcol]).strip() for r in body
-                                         if pcol < len(r) and str(r[pcol]).strip()))
-            shown = ", ".join(parties[:8]) + (" …" if len(parties) > 8 else "")
-            return None, [f"{label_}: no row matches “{names[0]}”, so nothing was taken from it. "
-                          f"The parties in it are: {shown}. Enter the name as the sheet spells it."], False
-        # No party column and no mention — a single-party statement.
-        return body, [f"{label_}: has no party column, so all {len(body)} rows were read as "
-                      f"belonging to “{names[0]}”. Confirm that."], False
-
-    if pcol >= 0:
-        parties = list(dict.fromkeys(str(r[pcol]).strip() for r in body
-                                     if pcol < len(r) and str(r[pcol]).strip()))
-        if len(parties) > 1:
-            shown = ", ".join(parties[:8]) + (" …" if len(parties) > 8 else "")
-            return None, [f"{label_}: holds {len(parties)} different parties ({shown}). Name the "
-                          f"noticee and only that party's rows and total will be taken."], False
-    return body, [], False
+            "proprietor", "company", "messrs",
+            "auto", "autos", "spare", "spares", "tyre", "tyres", "tube", "tubes",
+            "motor", "motors", "wheel", "wheels", "trader", "traders", "trading",
+            "enterprise", "enterprises", "agency", "agencies", "automobile",
+            "automobiles", "sales", "service", "services", "centre", "center",
+            "house", "depot", "store", "stores", "works", "india", "corporation"}
+    return [w for w in re.sub(r"[^a-z0-9]+", " ", str(s).lower()).split()
+            if len(w) > 2 and w not in stop]
 
 
 def deterministic(kind: str, case: dict, docs: list[Doc]) -> Found:
     out = Found()
-    matched_sheet = False
+    known_party = case.get("noticee_name") or case.get("client_name") or ""
     table_key = "soa" if kind == "recovery" else ("prices" if kind == "price" else "invoices")
 
     for d in docs:
@@ -348,19 +288,26 @@ def deterministic(kind: str, case: dict, docs: list[Doc]) -> Found:
                     continue
                 cols = _sniff(header, body)
 
-                # A sheet's own "Total" line is not an invoice — summing it doubles the demand.
-                body = [r for r in body if not _is_total_row(r)]
-                picked, pnotes, filtered = _pick_party_rows(d.name, t["sheet"], body,
-                                                            cols["party"], case)
-                out.notes += pnotes
-                if picked is None or not picked:
-                    continue
-                if matched_sheet and not filtered:
-                    continue                 # never let an unfiltered sheet replace the party's rows
-                body = picked
-                if filtered:
-                    matched_sheet = True
-                    out.filtered = True
+                want = _tokens(known_party)
+                if want and cols["party"] >= 0:
+                    hits = [r for r in body
+                            if any(w in re.sub(r"[^a-z0-9]+", " ", str(r[cols['party']]).lower())
+                                   for w in want)]
+                    if hits and len(hits) < len(body):
+                        out.notes.append(
+                            f"{d.name}: kept {len(hits)} of {len(body)} rows matching “{known_party}”.")
+                        body = hits
+                    elif not hits:
+                        # Better no figure than the whole ledger's figure.
+                        out.notes.append(
+                            f"{d.name}: no row matched “{known_party}”, so nothing was taken from this "
+                            f"file. Check the name in the sheet against the name on the notice.")
+                        continue
+                elif want and cols["party"] < 0:
+                    out.notes.append(
+                        f"{d.name}: no party/customer column was found, so the rows could not be "
+                        f"narrowed to “{known_party}”. Any total here would cover every counterparty "
+                        f"in the file — check it before use.")
 
                 spec = TABLE_COLS.get(table_key, [])
                 built = []
@@ -442,7 +389,7 @@ def deterministic(kind: str, case: dict, docs: list[Doc]) -> Found:
             if nt:
                 out.values.setdefault("noticee_type", nt)
                 out.evidence.setdefault("noticee_type", d.name)
-            if nt.startswith("Company"):
+            if nt.startswith(("Company","Partnership")):
                 dirs = _directors(t, out.values.get("noticee_address", ""))
                 if dirs:
                     out.values.setdefault("directors", dirs)
@@ -462,8 +409,14 @@ def deterministic(kind: str, case: dict, docs: list[Doc]) -> Found:
                 n = len(re.findall(r"(^|\n)\s*\(?\d{1,2}[.)]", t))
                 if n:
                     out.values.setdefault(
-                        "paras", [dict(n=str(i), stance="Deny", text="") for i in range(1, n + 1)])
+                        # Stance left blank deliberately: denying every paragraph
+                        # is a legal position, not a default, and the app has no
+                        # basis for taking it on the user's behalf.
+                        "paras", [dict(n=str(i), stance="", text="") for i in range(1, n + 1)])
                     out.evidence.setdefault("paras", f"{d.name}: {n} numbered paragraphs")
+                    out.notes.append(
+                        f"{d.name}: {n} numbered paragraphs found. Set a stance for each — they are "
+                        f"deliberately left blank rather than denied by default.")
 
         elif d.kind == "image":
             out.notes.append(f"{d.name}: an image — no model key configured, so it was not read.")
@@ -472,29 +425,116 @@ def deterministic(kind: str, case: dict, docs: list[Doc]) -> Found:
     return out
 
 
+_BAD_BANK = re.compile(r"cheque\s*no|dated|for\s*inr|drawn\s*on", re.I)
+
+
+def _plausible(key: str, value) -> bool:
+    """Is a model-returned value the right shape for its field?
+
+    The model wins over the deterministic regex floor, which is usually right —
+    but when it returns a fragment ("oices" for an invoice number) or swallows a
+    whole sentence into a field ("drawn on Cheque No. 004521 dated ... issued"),
+    that overwrites a correct parse with rubbish that then prints in the notice.
+    Values failing this check are dropped, leaving the deterministic value.
+    """
+    if isinstance(value, list):
+        return all(_plausible_row(r) for r in value if isinstance(r, dict))
+    s = str(value or "").strip()
+    if key in ("bank",) and (len(s) > 90 or _BAD_BANK.search(s)):
+        return False
+    return True
+
+
+def _plausible_row(row: dict) -> bool:
+    ref = str(row.get("no") or row.get("ref") or "").strip()
+    # "oices" — the tail of "invoices" caught by a loose capture.
+    if ref and (len(ref) < 4 or ref.lower() in ("oices", "voice", "nvoice", "oice")):
+        return False
+    bank = str(row.get("bank") or "")
+    if bank and (len(bank) > 90 or _BAD_BANK.search(bank)):
+        return False
+    return True
+
+
 # --------------------------------------------------------------------------
-def _only_party_rows(d: Doc, case: dict) -> Doc:
-    """A copy of a spreadsheet Doc holding only the named party's rows, so the
-    model is not handed every dealer's ledger and asked to ignore most of it."""
-    if d.kind != "tables" or not _party_names(case):
-        return d
-    tables = []
-    for t in d.tables:
-        rows = t["rows"]
-        hi = _header_row(rows)
-        header = [str(c).strip() for c in rows[hi]]
-        body = [r for r in rows[hi + 1:] if any(str(c).strip() for c in r)]
-        if not body:
-            continue
-        picked, _, filtered = _pick_party_rows(d.name, t["sheet"], body,
-                                               _sniff(header, body)["party"], case)
-        # No match: send the sheet as-is so the model can try a looser reading
-        # of the name — the prompt tells it to keep only that party's rows.
-        tables.append(dict(sheet=t["sheet"],
-                           rows=rows[:hi + 1] + picked if filtered and picked else rows))
-    return Doc(name=d.name, kind=d.kind, tables=tables, digest=d.digest)
+def _fix_noticees(case: dict, found: Found) -> Found:
+    """Recover the company-and-directors shape from a collapsed name.
+
+    draft.py already renders Noticee No. 1 / 2 / 3 blocks and says "jointly and
+    severally" — but only when noticee_type says Company and directors[] is
+    populated. The model path returns the names as one string ("Company; Mr A;
+    Mrs B") and no directors, so none of that machinery ever fires and three
+    addressees print on a single line. This puts the structure back.
+    """
+    v = found.values
+    blob = "\n".join(x for x in [
+        str(v.get("noticee_name") or ""),
+        str(case.get("_narrative") or ""),
+        *(str(case.get(k) or "") for k in case if str(k).startswith("_raw_")),
+    ] if x.strip())
+    if not blob.strip():
+        return found
+
+    if not str(v.get("noticee_type") or "").strip():
+        t = _noticee_type(blob)
+        if t:
+            v["noticee_type"] = t
+            found.evidence.setdefault("noticee_type", "inferred from the names you gave")
+
+    if str(v.get("noticee_type") or "").startswith(("Company","Partnership")) and not v.get("directors"):
+        dirs = _directors(blob, str(v.get("noticee_address") or ""))
+        if dirs:
+            v["directors"] = dirs
+            found.evidence.setdefault("directors", f"{len(dirs)} director(s) named alongside the company")
+
+    # With the directors held separately, noticee_name is the company alone.
+    name = str(v.get("noticee_name") or "")
+    if v.get("directors") and (";" in name or "\n" in name):
+        first = re.split(r"[;\n]", name)[0].strip(" ,")
+        taken = {str(d.get("name", "")).lower() for d in v["directors"]}
+        if first and first.lower() not in taken:
+            v["noticee_name"] = first
+
+    # "Noticee No. 1:" is a label in the answer box, not part of anyone's name,
+    # and a director's address must not swallow the rest of the list.
+    # "Noticee No. 1: M/s Deccan Auto Tyres, a partnership firm registered
+    # under..." — the address parser splits on the first comma and leaves the
+    # descriptor clause as the name. Recover the actual name from the label.
+    m = re.search(r"noticee\s*no\.?\s*1\s*[:.\-–]\s*([^,\n]+)", blob, re.I)
+    if m:
+        real = m.group(1).strip(" ,;")
+        cur = str(v.get("noticee_name") or "")
+        looks_descriptive = bool(re.match(r"^(a|an|the)\s|^(partnership|company|firm|sole)\b", cur, re.I))
+        if real and (not cur or looks_descriptive):
+            v["noticee_name"] = real
+            found.evidence["noticee_name"] = "named after the Noticee No. 1 label"
+
+    def _clean_addr(a: str) -> str:
+        """The splitter can leave "1932, principal place of business at ..." —
+        the tail of "Indian Partnership Act, 1932" plus a connective phrase."""
+        a = str(a or "").strip(" ,;")
+        a = re.sub(r"^\d{4}\s*,\s*", "", a)                       # stray year
+        a = re.sub(r"^(?:having\s+(?:its|their)\s+)?"
+                   r"(?:principal\s+place\s+of\s+business|registered\s+office|"
+                   r"place\s+of\s+business|office)\s+(?:at\s+)?", "", a, flags=re.I)
+        return a.strip(" ,;")
+
+    lbl = re.compile(r"^\s*noticee\s*no\.?\s*\d+\s*[:.\-–]?\s*", re.I)
+    cut = re.compile(r"\s*noticee\s*no\.?\s*\d+.*$", re.I | re.S)
+    if v.get("noticee_name"):
+        v["noticee_name"] = lbl.sub("", str(v["noticee_name"])).strip(" ,;")
+    if v.get("noticee_address"):
+        v["noticee_address"] = _clean_addr(cut.sub("", str(v["noticee_address"])))
+    for d in v.get("directors") or []:
+        d["name"] = lbl.sub("", str(d.get("name", ""))).strip(" ,;")
+        addr = _clean_addr(cut.sub("", str(d.get("address", ""))))
+        if not addr or re.search(r"same address", addr, re.I):
+            addr = str(v.get("noticee_address") or "")
+        d["address"] = addr
+    return found
 
 
+# --------------------------------------------------------------------------
 def analyse(kind: str, case: dict, docs: list[Doc]) -> Found:
     """Model first when a key is present, deterministic reader as the floor.
 
@@ -513,17 +553,15 @@ def analyse(kind: str, case: dict, docs: list[Doc]) -> Found:
     ft_vals, ft_ev = from_text(kind, case)
     nv_vals, nv_ev, nv_notes = narrative(kind, story) if story else ({}, {}, [])
 
-    # The noticee's name usually arrives in the "addressed to" box or the account,
-    # not in case["noticee_name"] — that field is only filled *after* analysis. The
-    # sheets must be read knowing who the notice is for, or every dealer's rows
-    # come back. So what was typed is folded in first.
-    ctx = dict(case)
-    for vals in (ft_vals, nv_vals):
-        for k, v in vals.items():
-            if ctx.get(k) in (None, "", [], {}):
-                ctx[k] = v
-
-    base = deterministic(kind, ctx, docs)
+    # The document reader filters a ledger down to this counterparty — so it has
+    # to know who that is BEFORE it reads. When the name was only typed into the
+    # answer box, reading first meant no filter and a whole-file total.
+    seed = dict(case)
+    for src in (ft_vals, nv_vals):
+        for k in ("noticee_name", "firm_name", "client_name"):
+            if not str(seed.get(k) or "").strip() and str(src.get(k) or "").strip():
+                seed[k] = src[k]
+    base = deterministic(kind, seed, docs)
 
     def with_typed(found: Found) -> Found:
         """The user's own words are the floor under everything else: a field the
@@ -544,9 +582,9 @@ def analyse(kind: str, case: dict, docs: list[Doc]) -> Found:
     if not llm_ready():
         base.notes.append("No model key configured — your answers and any documents were read "
                           "directly. Set GROQ_API_KEY to have them actually reasoned over.")
-        return with_typed(base)
+        return _fix_noticees(case, with_typed(base))
 
-    readable = [_only_party_rows(d, ctx) for d in docs if d.kind in ("tables", "text")]
+    readable = [d for d in docs if d.kind in ("tables", "text")]
     if story_doc:
         readable = readable + [story_doc]
     images = [d for d in docs if d.kind == "image"]
@@ -556,22 +594,22 @@ def analyse(kind: str, case: dict, docs: list[Doc]) -> Found:
 
     # The model is worth a call even with no attachment: the typed answers are
     # in the prompt, and it reads a messy sentence better than any regex.
-    for got in ([_call_text(kind, ctx, readable)] if (readable or typed) else []) + \
-               ([_call_vision(kind, ctx, images)] if images else []):
+    for got in ([_call_text(kind, case, readable)] if (readable or typed) else []) + \
+               ([_call_vision(kind, case, images)] if images else []):
         if got.error:
             merged.notes.append(f"Model call failed ({got.error}) — deterministic reading kept.")
             continue
         for k, v in (got.values or {}).items():
             if v in (None, "", [], {}):
                 continue
-            if (base.filtered and k in TABLE_COLS and isinstance(v, list)
-                    and len(v) > len(base.values.get(k) or [])):
-                merged.notes.append(f"The model returned {len(v)} {label(k)} rows; only the "
-                                    f"{len(base.values.get(k) or [])} for the named party were kept.")
+            if not _plausible(k, v):
+                merged.notes.append(
+                    f"The model's value for “{k}” looked malformed and was discarded; the reading "
+                    f"taken directly from your input was kept instead.")
                 continue
             merged.values[k] = v                      # the model wins over the regex floor
             if got.evidence.get(k):
                 merged.evidence[k] = got.evidence[k]
         merged.missing += [m for m in got.missing if m not in merged.missing]
         merged.notes += [n for n in got.notes if n not in merged.notes]
-    return with_typed(merged)
+    return _fix_noticees(case, with_typed(merged))
