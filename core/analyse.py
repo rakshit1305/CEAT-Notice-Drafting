@@ -19,7 +19,7 @@ from .config import llm_ready, llm_settings
 from .extract import Doc
 from .freetext import _cheques, _directors, _invoices, _noticee_type
 from .schema import LABELS, TABLE_COLS, label
-from .words import find_amounts, find_dates, iso, to_float
+from .words import find_amounts, find_dates, fmt_amount, iso, to_float
 
 SCALAR_KEYS = [k for k in LABELS if k not in TABLE_COLS]
 
@@ -534,33 +534,66 @@ def _fix_noticees(case: dict, found: Found) -> Found:
     return found
 
 
-def _prefer_filtered_rows(base: Found, merged: Found, case: dict) -> Found:
-    """If the model returned a whole ledger, keep the deterministic filtered read.
+def _rows_total(rows_) -> float:
+    t = 0.0
+    for r in rows_ or []:
+        if not isinstance(r, dict):
+            continue
+        v = to_float(r.get("amt") if r.get("amt") not in (None, "") else r.get("amount"))
+        t += v or 0.0
+    return round(t, 2)
 
-    The prompt tells the model to keep only this counterparty's rows. Telling it
-    is not the same as enforcing it — when it returns the lot, the validator
-    stops the draft and the user is left stuck. The deterministic reader has
-    already filtered on the party column, so where its row set is dramatically
-    smaller, it is the trustworthy one and is put back.
+
+def _consistent(vals: dict, key: str) -> bool:
+    """Does the demanded total equal the sum of the rows the notice will list?"""
+    rows_ = vals.get(key) or []
+    amt = to_float(vals.get("amount"))
+    if not rows_ or amt is None:
+        return False
+    return abs(_rows_total(rows_) - round(amt, 2)) <= 1
+
+
+def _prefer_filtered_rows(base: Found, merged: Found, case: dict) -> Found:
+    """Keep the deterministic filtered read when the merged one does not add up.
+
+    Two ways this goes wrong. The model returns the whole ledger, or — worse,
+    because it looks plausible — it returns a handful of rows while the total
+    still comes from somewhere else entirely. Either way the rows and the figure
+    disagree, and a demand whose total does not match the invoices listed under
+    it is indefensible. The deterministic reader has already filtered on the
+    party column and summed exactly the rows it kept, so where it is internally
+    consistent and the merge is not, it is put back as a pair.
     """
     for key in ("soa", "invoices"):
         m_rows = merged.values.get(key) or []
         b_rows = base.values.get(key) or []
-        if not isinstance(m_rows, list) or not isinstance(b_rows, list):
+        if not isinstance(m_rows, list) or not isinstance(b_rows, list) or not b_rows:
             continue
-        if len(m_rows) > 40 and b_rows and len(b_rows) * 3 < len(m_rows):
-            merged.values[key] = b_rows
-            if base.evidence.get(key):
-                merged.evidence[key] = base.evidence[key]
-            # The total must follow the rows it is supposed to sum.
-            if base.values.get("amount") is not None:
-                merged.values["amount"] = base.values["amount"]
-                if base.evidence.get("amount"):
-                    merged.evidence["amount"] = base.evidence["amount"]
-            merged.notes.append(
-                f"The model returned {len(m_rows)} rows for “{key}” — the whole ledger rather than "
-                f"{case.get('noticee_name') or 'this counterparty'}'s rows. The filtered reading of "
-                f"{len(b_rows)} row(s) was used instead.")
+
+        whole_ledger = len(m_rows) > 40 and len(b_rows) * 3 < len(m_rows)
+        mismatch = bool(m_rows) and not _consistent(merged.values, key)
+        if not (whole_ledger or mismatch):
+            continue
+        if not _consistent(base.values, key):
+            continue                      # the floor is no better — leave the blocker
+
+        old_amt = to_float(merged.values.get("amount")) or 0
+        merged.values[key] = b_rows
+        merged.values["amount"] = base.values["amount"]
+        for k in (key, "amount"):
+            if base.evidence.get(k):
+                merged.evidence[k] = base.evidence[k]
+        if whole_ledger:
+            why = (f"the model returned {len(m_rows)} rows — the whole ledger rather than "
+                   f"{case.get('noticee_name') or 'this counterparty'}'s rows")
+        else:
+            why = (f"the model's {len(m_rows)} row(s) totalled "
+                   f"INR {fmt_amount(_rows_total(m_rows))} against a demand of "
+                   f"INR {fmt_amount(old_amt)}, which do not agree")
+        merged.notes.append(
+            f"Statement of account: {why}. The filtered reading of {len(b_rows)} row(s) totalling "
+            f"INR {fmt_amount(base.values['amount'])} was used instead, so the figure demanded is the "
+            f"sum of the invoices the notice lists.")
     return merged
 
 
