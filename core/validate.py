@@ -324,12 +324,24 @@ def validate(kind: str, case: dict, docs=None) -> Report:
     # inflate the demand, so both are stopped here rather than flagged.
     soa = rows(case, "soa")
     if soa:
-        listed = round(_sum(soa, "amount"), 2)
+        # The rows carry "amt" (see TABLE_COLS), not "amount" — summing the
+        # wrong key returned 0 and this check silently never fired.
+        listed = round(_sum(soa, "amt") or _sum(soa, "amount"), 2)
         if amt and listed and abs(listed - round(float(amt), 2)) > 1:
             r.blockers.append(
                 f"The statement of account lists {len(soa)} row(s) totalling INR {fmt_amount(listed)}, "
                 f"but the notice demands INR {fmt_amount(amt)}. One of them is drawn from the wrong "
                 f"rows — most often the whole ledger rather than this counterparty's rows."
+            )
+        # A single dealer's statement does not usually run to dozens of lines.
+        # If it does, the ledger was probably never narrowed to this party, and
+        # the total will reconcile to itself while still being everyone's.
+        if len(soa) > 40:
+            r.blockers.append(
+                f"The statement of account has {len(soa)} rows. That is far more than one counterparty's "
+                f"account normally carries, and suggests the ledger was not narrowed to "
+                f"{case.get('noticee_name') or 'this noticee'}. Check the rows belong to this party "
+                f"before drafting — other customers' invoices must not appear in this notice."
             )
         who = " ".join(_tokens_of(case.get("noticee_name")))
         if who:
