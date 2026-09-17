@@ -1,165 +1,196 @@
-"""Turn an uploaded file into something the analyser can reason over.
+"""Indian-format numbers, dates and amounts-in-words.
 
-Spreadsheets come back as tables (every sheet), documents as text, images as
-base64 for the vision model. Nothing is interpreted here — that is analyse.py.
+House style requires every amount in figures AND words, dates as DD.MM.YYYY,
+and grouping in the Indian system (lakh, crore).
 """
 from __future__ import annotations
-import base64
-import hashlib
-import io
 import re
-from dataclasses import dataclass, field
+from datetime import date, datetime
 
-from .config import MAX_DOC_CHARS, MAX_SHEET_ROWS
-
-IMAGE_EXT = {"jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"}
-SHEET_EXT = {"xlsx", "xls", "xlsm", "csv"}
-DOC_EXT = {"pdf", "docx", "doc", "txt", "md"}
-
-
-@dataclass
-class Doc:
-    name: str
-    kind: str = "text"                 # text | tables | image | error
-    text: str = ""
-    tables: list[dict] = field(default_factory=list)   # {sheet, rows:[[...]]}
-    b64: str = ""
-    mime: str = ""
-    note: str = ""
-    digest: str = ""
-
-    @property
-    def dropped_rows(self) -> int:
-        """Rows in the file that MAX_SHEET_ROWS kept from the model.
-
-        validate.py already blocks on this; without the property it read 0
-        through getattr and a truncated ledger passed silently.
-        """
-        if self.kind != "tables":
-            return 0
-        return sum(max(0, len(t["rows"]) - MAX_SHEET_ROWS) for t in self.tables)
-
-    @property
-    def dropped_chars(self) -> int:
-        if self.kind == "tables":
-            full = 0
-            for t in self.tables:
-                for r in t["rows"]:
-                    full += len(" | ".join("" if c is None else str(c).strip() for c in r)) + 1
-        else:
-            full = len(self.text or "")
-        return max(0, full - MAX_DOC_CHARS)
-
-    def as_prompt(self) -> str:
-        """A compact, faithful rendering for the model."""
-        if self.kind == "tables":
-            out = []
-            for t in self.tables:
-                out.append(f"--- sheet: {t['sheet']} ({len(t['rows'])} rows) ---")
-                for r in t["rows"][:MAX_SHEET_ROWS]:
-                    cells = ["" if c is None else str(c).strip() for c in r]
-                    if any(cells):
-                        out.append(" | ".join(cells))
-                if len(t["rows"]) > MAX_SHEET_ROWS:
-                    out.append(f"... {len(t['rows']) - MAX_SHEET_ROWS} further rows not shown")
-            return "\n".join(out)[:MAX_DOC_CHARS]
-        return (self.text or "")[:MAX_DOC_CHARS]
+ONES = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
+        "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen",
+        "Eighteen", "Nineteen"]
+TENS = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"]
 
 
-def _digest(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()[:16]
+def _u100(n: int) -> str:
+    return ONES[n] if n < 20 else (TENS[n // 10] + (" " + ONES[n % 10] if n % 10 else ""))
 
 
-def extract(name: str, data: bytes) -> Doc:
-    ext = (name.rsplit(".", 1)[-1] if "." in name else "").lower()
-    d = Doc(name=name, digest=_digest(data))
-
-    if ext in IMAGE_EXT:
-        d.kind = "image"
-        d.b64 = base64.b64encode(data).decode()
-        d.mime = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
-        return d
-
-    try:
-        if ext == "csv":
-            d.kind = "tables"
-            d.tables = [dict(sheet="csv", rows=_csv_rows(data))]
-        elif ext in ("xlsx", "xls", "xlsm"):
-            d.kind = "tables"
-            d.tables = _excel_tables(data)
-        elif ext == "pdf":
-            d.text, pages, has_text = _pdf_text(data)
-            if not has_text:
-                d.kind = "error"
-                d.note = (f"no text layer across {pages} page(s) — this is a scan, so it is an image. "
-                          "Export it as an image and attach that, and the vision model will read it.")
-            else:
-                d.kind = "text"
-        elif ext == "docx":
-            d.kind = "text"
-            d.text = _docx_text(data)
-        elif ext == "doc":
-            d.kind = "error"
-            d.note = "legacy .doc cannot be parsed — save as .docx or PDF"
-        else:
-            d.kind = "text"
-            d.text = data.decode("utf-8", errors="replace")
-    except Exception as e:                                  # never crash the app on a bad file
-        d.kind = "error"
-        d.note = f"{type(e).__name__}: {e}"
-    return d
-
-
-# --------------------------------------------------------------------------
-def _csv_rows(data: bytes) -> list[list]:
-    import csv
-    text = data.decode("utf-8-sig", errors="replace")
-    sample = text[:4096]
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-    except Exception:
-        dialect = csv.excel
-    rows = [r for r in csv.reader(io.StringIO(text), dialect)]
-    return [r for r in rows if any(str(c).strip() for c in r)]
-
-
-def _excel_tables(data: bytes) -> list[dict]:
-    import pandas as pd
-    book = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=object)
-    out = []
-    for sheet, df in book.items():
-        df = df.dropna(how="all").dropna(axis=1, how="all")
-        rows = [["" if (v is None or (isinstance(v, float) and v != v)) else v for v in row]
-                for row in df.values.tolist()]
-        if rows:
-            out.append(dict(sheet=str(sheet), rows=rows))
+def _u1000(n: int) -> str:
+    h, r = divmod(n, 100)
+    out = (ONES[h] + " Hundred" if h else "")
+    if r:
+        out += (" " if out else "") + _u100(r)
     return out
 
 
-def _pdf_text(data: bytes) -> tuple[str, int, bool]:
-    import pdfplumber
-    chunks: list[str] = []
-    pages = 0
-    with pdfplumber.open(io.BytesIO(data)) as pdf:
-        pages = len(pdf.pages)
-        for page in pdf.pages[:30]:
-            chunks.append(page.extract_text() or "")
-            for tbl in (page.extract_tables() or []):
-                for row in tbl:
-                    cells = [("" if c is None else str(c).strip()) for c in row]
-                    if any(cells):
-                        chunks.append(" | ".join(cells))
-    text = re.sub(r"\n{3,}", "\n\n", "\n".join(chunks)).strip()
-    return text, pages, len(re.sub(r"\s", "", text)) >= 40
+def to_words(value) -> str:
+    """7,50,400 -> 'Rupees Seven Lakh Fifty Thousand Four Hundred Only'"""
+    n = to_float(value)
+    if n is None:
+        return ""
+    whole = int(n)
+    paise = int(round((n - whole) * 100))
+    if whole == 0 and paise == 0:
+        return ""
+    parts: list[str] = []
+    crore, whole = divmod(whole, 10_000_000)
+    lakh, whole = divmod(whole, 100_000)
+    thou, whole = divmod(whole, 1_000)
+    if crore:
+        parts.append(_u1000(crore) + " Crore")
+    if lakh:
+        parts.append(_u1000(lakh) + " Lakh")
+    if thou:
+        parts.append(_u1000(thou) + " Thousand")
+    if whole:
+        parts.append(_u1000(whole))
+    s = "Rupees " + " ".join(p for p in parts if p).strip()
+    if paise:
+        s += " and Paise " + _u100(paise)
+    return s + " Only"
 
 
-def _docx_text(data: bytes) -> str:
-    import docx
-    doc = docx.Document(io.BytesIO(data))
-    parts = [p.text for p in doc.paragraphs]
-    for t in doc.tables:
-        for row in t.rows:
-            cells = [c.text.strip() for c in row.cells]
-            if any(cells):
-                parts.append(" | ".join(cells))
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(parts)).strip()
+_FILLER = r"\b(rupees|rupee|rs|inr|only|and)\b"
+
+
+def words_key(value) -> str:
+    """A comparison key for an amount in words.
+
+    Keeps the number words, drops the currency prefix, the trailing "Only" and
+    any "and" — so "Five Lakh Seventy Six Thousand Only" and "Rupees Five Lakh
+    Seventy Six Thousand Only" compare equal, while a genuine difference in the
+    figure still does not. "Paise" is deliberately kept.
+    """
+    t = re.sub(r"[^a-z]", " ", str(value).lower())
+    t = re.sub(_FILLER, " ", t)
+    return re.sub(r"\s+", "", t)
+
+
+def house_words(value) -> str:
+    """Put a typed amount-in-words into CEAT house form: 'Rupees ... Only'.
+
+    draft.py prints the typed string verbatim, so without this a notice could
+    read "Five Lakh Seventy Six Thousand Only" with no currency named.
+    """
+    t = " ".join(str(value or "").split()).strip().rstrip(".")
+    if not t:
+        return ""
+    if re.match(r"^(rupees|rupee|rs|inr)\b", t, re.I):
+        t = re.sub(r"^(rupees|rupee|rs|inr)\b\.?\s*", "Rupees ", t, flags=re.I)
+    else:
+        t = "Rupees " + t
+    if not re.search(r"\bonly$", t, re.I):
+        t = t + " Only"
+    return t
+
+
+def to_float(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = re.sub(r"[^\d.\-]", "", str(value))
+    if s in ("", "-", "."):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def fmt_amount(value) -> str:
+    """8,42,150 in the Indian grouping; paise shown only when they are real."""
+    n = to_float(value)
+    if n is None:
+        return ""
+    neg = n < 0
+    n = abs(n)
+    whole = int(n)
+    dec = f"{n - whole:.2f}"[2:]
+    s = str(whole)
+    if len(s) > 3:
+        head, tail = s[:-3], s[-3:]
+        head = re.sub(r"(\d)(?=(\d\d)+$)", r"\1,", head)
+        s = head + "," + tail
+    # A notice writes 2,00,000/- not 2,00,000.00/-. Real paise are kept.
+    if dec == "00":
+        return ("-" if neg else "") + s
+    return ("-" if neg else "") + s + "." + dec
+
+
+def inr(value) -> str:
+    a = fmt_amount(value)
+    return f"INR {a}/-" if a else ""
+
+
+# --------------------------------------------------------------------------
+MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def parse_date(value):
+    """Anything date-ish -> a datetime.date, or None. Day-first, as in India."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    s = str(value).strip()
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        try:
+            return date(int(m[1]), int(m[2]), int(m[3]))
+        except ValueError:
+            return None
+    m = re.match(r"^(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})$", s)
+    if m:
+        d_, mo, y = int(m[1]), int(m[2]), int(m[3])
+        if y < 100:
+            y += 2000 if y < 50 else 1900
+        try:
+            return date(y, mo, d_)
+        except ValueError:
+            return None
+    m = re.match(r"^(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{4})$", s)
+    if m and m[2][:3].lower() in MONTHS:
+        try:
+            return date(int(m[3]), MONTHS[m[2][:3].lower()], int(m[1]))
+        except ValueError:
+            return None
+    return None
+
+
+def fmt_date(value) -> str:
+    d = parse_date(value)
+    return d.strftime("%d.%m.%Y") if d else (str(value) if value else "")
+
+
+def iso(value) -> str:
+    d = parse_date(value)
+    return d.isoformat() if d else ""
+
+
+def find_dates(text: str) -> list[str]:
+    """Every date in a blob of text, in order of appearance, as ISO strings."""
+    out: list[str] = []
+    for m in re.finditer(r"\b(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})\b", text or ""):
+        d = parse_date(f"{m[1]}.{m[2]}.{m[3]}")
+        if d and d.isoformat() not in out:
+            out.append(d.isoformat())
+    for m in re.finditer(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{4})\b", text or ""):
+        d = parse_date(f"{m[1]} {m[2]} {m[3]}")
+        if d and d.isoformat() not in out:
+            out.append(d.isoformat())
+    return out
+
+
+def find_amounts(text: str) -> list[float]:
+    out: list[float] = []
+    for m in re.finditer(r"(?:INR|Rs\.?|₹)\s*([0-9][0-9,]*(?:\.\d{1,2})?)", text or "", re.I):
+        v = to_float(m[1])
+        if v is not None and v not in out:
+            out.append(v)
+    return sorted(out, reverse=True)
