@@ -176,13 +176,28 @@ def _parse(kind: str, qid: str, raw: str, case: dict) -> dict:
 
     elif qid == "amt":
         amts = find_amounts(t)
-        if amts:
-            near = re.search(r"(?:demand(?:ed)?|balance|payable|outstanding|due)[^\d]{0,24}"
-                             r"(?:INR|Rs\.?|₹)?\s*([\d,]+(?:\.\d{1,2})?)", t, re.I)
-            v["amount"] = (re.sub(r"[^\d.]", "", near.group(1)) if near else str(max(amts)))
-        if re.search(r"\bpart[- ]?pay", low) and not re.search(
-                r"\b(?:no|none|nil|without any)\b[^.]{0,24}part[- ]?pay", low):
+        none_paid = bool(re.search(r"\b(?:no|none|nil|not|without any)\b[^.]{0,30}"
+                                   r"(?:part[- ]?pay|payment)", low))
+        paid = re.search(r"(?:INR|Rs\.?|₹)\s*([\d,]+(?:\.\d{1,2})?)[^.;\n]{0,40}?"
+                         r"\b(?:received|paid|part[- ]?pa(?:id|yment))", t, re.I) or \
+            re.search(r"\b(?:received|paid|part[- ]?payment of)\b[^\d.;\n]{0,20}"
+                      r"(?:INR|Rs\.?|₹)\s*([\d,]+(?:\.\d{1,2})?)", t, re.I)
+        if none_paid:
+            v["part_paid"] = "0"
+        elif paid:
+            v["part_paid"] = re.sub(r"[^\d.]", "", paid.group(1))
+            # A factual description only — this text is never printed as-is.
             v["part_payment"] = t
+            d = find_dates(t)
+            if d:
+                v["part_paid_date"] = d[0]
+        if amts:
+            near = re.search(r"(?:demand(?:ed)?|balance|payable|outstanding|due|limited to)[^\d]{0,48}?"
+                             r"(?:INR|Rs\.?|₹)\s*([\d,]+(?:\.\d{1,2})?)", t, re.I)
+            if near:
+                v["amount"] = re.sub(r"[^\d.]", "", near.group(1))
+            elif none_paid or not paid:
+                v["amount"] = str(max(amts))
 
     elif qid == "total":
         amts = find_amounts(t)

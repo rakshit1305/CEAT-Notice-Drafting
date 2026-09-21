@@ -44,8 +44,11 @@ GROQ_VISION_MODEL = _secret("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
 
 OPENAI_KEY = _secret("OPENAI_API_KEY")
 OPENAI_BASE = _secret("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_TEXT_MODEL = _secret("OPENAI_TEXT_MODEL", "gpt-4o-mini")
-OPENAI_VISION_MODEL = _secret("OPENAI_VISION_MODEL", "gpt-4o-mini")
+# The fallback used to be gpt-4o-mini — a "mini" tier, which .env.example itself
+# warns against. The model now also writes and proof-reads wording, so the
+# default is a full-size model.
+OPENAI_TEXT_MODEL = _secret("OPENAI_TEXT_MODEL", "gpt-5.1")
+OPENAI_VISION_MODEL = _secret("OPENAI_VISION_MODEL", "gpt-5.1")
 
 
 def llm_settings() -> dict:

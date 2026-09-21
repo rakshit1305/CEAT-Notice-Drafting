@@ -5,7 +5,10 @@ One flat list of questions per notice type, exactly as the console shows them.
 everything else is optional and renders as [● ...] if left open.
 """
 from __future__ import annotations
+import re
 from dataclasses import dataclass, field
+
+from .words import find_amounts, to_float
 
 
 @dataclass
@@ -35,8 +38,10 @@ LABELS = {
     "invoices": "Invoices", "cheques": "Cheque particulars", "soa": "Statement of account",
     "presented_date": "Date presented", "dishonour_date": "Date of dishonour",
     "dishonour_reason": "Reason on the memo", "memo_date": "Bank memo date",
-    "part_payment": "Part-payments", "amount": "Amount", "amount_words": "Amount in words",
+    "part_payment": "Part-payments", "part_paid": "Part-payment received (INR)",
+    "part_paid_date": "Part-payment date", "amount": "Amount", "amount_words": "Amount in words",
     "as_on_date": "Outstanding as on", "interest": "Interest rate",
+    "interest_from": "Interest runs from",
     "principal": "Principal component", "tax": "GST / tax component",
     "jurisdiction": "Place of jurisdiction", "prior": "Prior notice",
     "prior_date": "Prior notice date", "prior_ref": "Prior notice subject",
@@ -48,7 +53,8 @@ LABELS = {
     "advocate_address": "Advocate's address", "reply_date": "Date of this reply",
     "client_name": "Client's name", "client_relation": "Client described as",
     "client_address": "Client's address", "product": "Product purchased",
-    "dealer": "Dealer / OEM", "claim_date": "Warranty claim received",
+    "dealer": "Dealer / OEM", "dealer_authorised": "Bought from an authorised CEAT dealer?",
+    "claim_date": "Warranty claim received",
     "inspection": "Inspection finding", "rejection": "Disposition communicated",
     "paras": "Para-by-para responses", "demands": "Demands raised",
     "blk_a": "Block A — principal to principal", "blk_b": "Block B — warranty procedure",
@@ -67,6 +73,50 @@ LABELS = {
     "impact": "Expected impact / duration", "mitigation": "Mitigation steps",
     "relief": "Relief sought", "reason": "Reason for the revision",
     "prices": "Revised prices", "pre_orders": "Orders placed before the effective date",
+}
+
+# What each field MEANS. The model used to receive bare keys such as
+# "client_name" and had to guess — it once put CEAT itself into the consumer's
+# slot. These definitions go into the analysis prompt verbatim.
+FIELD_HELP = {
+    "noticee_name": "the party the notice is addressed to (never CEAT). For a sole proprietorship, "
+                    "the proprietor's own name — the individual, not only the firm name",
+    "firm_name": "the proprietorship firm's trading name, e.g. 'M/s Sharma Tyres'",
+    "noticee_address": "the noticee's postal address",
+    "business": "the noticee's line of business as a phrase, e.g. 'the business of purchase and sale "
+                "of tyres' — not the relationship history",
+    "background": "how the dealing between CEAT and the noticee arose (dealership, since when, terms). "
+                  "Not the invoice or cheque particulars",
+    "relationship": "how the dealing between CEAT and the noticee arose",
+    "amount": "Section 138: the amount demanded = total of the dishonoured cheque(s) minus any "
+              "part-payment received AFTER dishonour; never the invoice total. Recovery: the total "
+              "outstanding. Digits only",
+    "part_payment": "a description of payments received after the cheque bounced. Leave empty if "
+                    "none were received",
+    "part_paid": "the total amount received after the cheque bounced, digits only; 0 if none",
+    "part_paid_date": "date of that part-payment",
+    "as_on_date": "the date the outstanding balance is stated as on",
+    "interest_from": "when interest starts, e.g. 'from the due date of each invoice'",
+    "client_name": "consumer reply: the CONSUMER on whose behalf the incoming notice was sent — the "
+                   "advocate's client. NEVER CEAT Limited, which is the recipient of that notice",
+    "client_relation": "consumer reply: how the consumer describes himself/herself, e.g. 'owner of "
+                       "vehicle GJ-01-RK-4567'",
+    "client_address": "consumer reply: the CONSUMER's address as given in the incoming notice — never "
+                      "CEAT's address",
+    "advocate_name": "consumer reply: the advocate who signed the incoming notice",
+    "advocate_address": "consumer reply: that advocate's office address",
+    "notice_date": "consumer reply: the date printed on the INCOMING notice. Every other type: the "
+                   "date this notice will carry",
+    "reply_date": "consumer reply: the date CEAT's reply will carry",
+    "dealer": "consumer reply: the dealer/OEM the consumer bought from",
+    "dealer_authorised": "consumer reply: 'Yes' if that dealer is an authorised CEAT dealer, 'No' if "
+                         "not, 'Not sure' otherwise",
+    "claim_date": "consumer reply: the date CEAT received the warranty claim, only if CEAT's own "
+                  "records show one",
+    "inspection": "consumer reply: CEAT's inspection finding, only if an inspection happened",
+    "obligation": "breach: what the clause required the other party to do",
+    "breach_facts": "breach: what actually happened — the particulars of the breach",
+    "consequences": "breach: what CEAT will do if the breach is not cured",
 }
 
 TABLE_COLS = {
@@ -110,7 +160,7 @@ CRITICAL = {
     "s138":        ["noticee_name", "noticee_address", "cheques", "dishonour_date",
                     "dishonour_reason", "amount"],
     "recovery":    ["noticee_name", "noticee_address", "amount", "as_on_date"],
-    "consumer":    ["incoming", "advocate_name", "client_name"],
+    "consumer":    ["incoming", "advocate_name", "client_name", "notice_date"],
     "breach":      ["noticee_name", "noticee_address", "agreement_name", "clause_no", "breach_facts"],
     "termination": ["noticee_name", "noticee_address", "agreement_name", "clause_no",
                     "ground", "effective_date"],
@@ -127,6 +177,8 @@ _PARTY = [
                ("Partnership + partners", "Partnership firm + partners", "Joint & several liability")]),
     Q("addr", "Who is it addressed to — full name(s) and address?",
       ["noticee_name", "noticee_address"], attach=True,
+      hint="For a sole proprietorship, give the proprietor's own name as well as the firm — a "
+           "proprietorship is not a separate legal person.",
       ph="e.g. M/s Sharma Tyres, Prop. Mr. Rakesh Sharma, Shop 14, MG Road, Jaipur – 302001. "
          "For a company, add the company name and each director's name."),
 ]
@@ -165,8 +217,11 @@ QUESTIONS: dict[str, list[Q]] = {
         Q("inv", "Which invoices does the cheque cover? Invoice numbers, dates and amounts.",
           ["invoices"], attach=True, ph="Invoice no. | date | amount (INR) — one per line"),
         Q("amt", "Have any part-payments been made since it bounced, and what is the balance now demanded?",
-          ["amount", "part_payment"],
-          ph="e.g. no part-payments; INR 7,50,400 demanded in full"),
+          ["amount", "part_payment", "part_paid", "part_paid_date"],
+          hint="The demand in a cheque notice is the cheque amount less any payment received after "
+               "it bounced — never the invoice total. State any payment as an amount and a date.",
+          ph="e.g. no part-payments; INR 7,50,400 demanded in full. "
+             "Or: INR 50,000 received on 25.06.2026; balance INR 7,00,400 demanded."),
         _JUR, _PRIOR] + _SEND,
 
     "recovery": _PARTY + [
@@ -179,6 +234,11 @@ QUESTIONS: dict[str, list[Q]] = {
           ph="e.g. INR 8,42,150.00 as on 31.08.2026"),
         Q("int", "What interest rate should the notice demand?", ["interest"], kind="chips",
           options=[("8", "8% p.a. (standard)"), ("12", "12% p.a."), ("18", "18% p.a.")]),
+        Q("int_from", "From when does interest run?", ["interest_from"], kind="chips",
+          options=[("from the due date of each invoice", "Due date of each invoice"),
+                   ("from the date of this notice", "Date of this notice"),
+                   ("from the as-on date stated above", "The as-on date")],
+          hint="Without a start date the interest demand cannot be worked out."),
         Q("tax", "Is the outstanding tax-inclusive? If so, the principal and the GST split.",
           ["principal", "tax"],
           ph="e.g. principal INR 7,13,686.44 and GST INR 1,28,463.56 — leave blank to omit the paragraph"),
@@ -195,6 +255,11 @@ QUESTIONS: dict[str, list[Q]] = {
         Q("client", "Who is their client, and what did they buy — from whom?",
           ["client_name", "client_relation", "client_address", "product", "dealer"],
           ph="e.g. Mr. A. Kumar, owner of vehicle TN-09-AB-1234, Chennai. Bought from Gill Tyre House, not CEAT."),
+        Q("dealer_auth", "Is that dealer an authorised CEAT dealer?", ["dealer_authorised"], kind="chips",
+          options=[("Yes", "Yes — authorised CEAT dealer"), ("No", "No — not our dealer / an OEM"),
+                   ("Not sure", "Not sure")],
+          hint="This decides the no-privity paragraph. Saying the purchase was not from an authorised "
+               "dealer when it was would be a false statement in a signed reply."),
         Q("facts", "What are CEAT's own facts? Claim date, inspection finding, what was communicated back.",
           ["claim_date", "inspection", "rejection"], attach=True,
           hint="Leave the finding blank rather than assume one — a blank becomes a VERIFY flag.",
@@ -203,7 +268,10 @@ QUESTIONS: dict[str, list[Q]] = {
         Q("demands", "What did they demand, and is any of it conceded?", ["demands"],
           kind="table", table="demands"),
         Q("rdate", "What date should the reply carry?", ["reply_date"], kind="date"),
-    ] + _SEND[1:],
+        # Not _SEND[1:]: that includes "What date should the notice carry?", which
+        # for a reply wrote TODAY into notice_date — the field the "Re: Your Notice
+        # dated …" line reads — so replies cited the incoming notice as dated today.
+    ] + [_SEND[1], _SEND[3]],
 
     "breach": _PARTY + [
         Q("agr", "Which agreement, and which clause has been breached?",
@@ -328,3 +396,27 @@ def effective(kind: str, case: dict) -> dict:
         if not str(out.get(key, "")).strip():
             out[key] = uniq[0] if len(uniq) == 1 else "; ".join(uniq)
     return out
+
+
+_NO_PART = re.compile(r"\b(?:no|none|nil|not|without any)\b[^.]{0,30}(?:part[- ]?pay|payment)", re.I)
+
+
+def part_paid(case: dict):
+    """Money received against the dishonoured cheque(s) after dishonour.
+
+    0.0 when none was received (or the answer says so), the amount when it is
+    stated, and None when a part-payment is described but no figure is given —
+    which the validator treats as a gap, never as zero.
+    """
+    v = case.get("part_paid")
+    if str(v if v is not None else "").strip() != "":
+        f = to_float(v)
+        if f is not None:
+            return f
+    t = str(case.get("part_payment") or "").strip()
+    if not t or _NO_PART.search(t):
+        return 0.0
+    m = re.search(r"(?:INR|Rs\.?|₹)\s*([\d,]+(?:\.\d{1,2})?)[^.;\n]{0,40}?\b(?:received|paid)", t, re.I) \
+        or re.search(r"\b(?:received|paid|part[- ]?payment of)\b[^\d.;\n]{0,20}(?:INR|Rs\.?|₹)\s*"
+                     r"([\d,]+(?:\.\d{1,2})?)", t, re.I)
+    return to_float(m.group(1)) if m else None

@@ -8,9 +8,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
+import re
+
+from . import compose as C
+from . import draft as DRAFT
 from . import skill_loader as SK
 from .config import MAX_DOC_CHARS, MAX_SHEET_ROWS
-from .schema import CRITICAL, TABLE_COLS, effective, is_filled, label, rows
+from .schema import CRITICAL, TABLE_COLS, effective, is_filled, label, part_paid, rows
 from .words import fmt_amount, fmt_date, parse_date, to_float, to_words, words_key
 
 
@@ -28,6 +32,7 @@ class Report:
     open_items: list = field(default_factory=list) # render as [● ...]
     annexures: list = field(default_factory=list)
     skill_checklist: list = field(default_factory=list)  # verbatim from SKILL.md/references
+    blanks: list = field(default_factory=list)     # [● …] still in the notice — no clean download
 
     @property
     def ok(self) -> bool:
@@ -93,9 +98,13 @@ def validate(kind: str, case: dict, docs=None) -> Report:
         who = case.get("signatory_name") or "the named signatory"
         add_flag("warn", f"Signing authority not confirmed — check that {who} is currently "
                          f"authorised to sign this notice type.")
-    if str(case.get("prior", "")).lower().startswith("don"):
-        add_flag("warn", "VERIFY: check for prior notices to this counterparty on this matter.")
-    elif str(case.get("prior", "")).lower().startswith("y"):
+    prior = str(case.get("prior", "")).strip().lower()
+    if kind in ("s138", "recovery", "breach", "termination") and (not prior or prior.startswith("don")):
+        # The skill: if the user doesn't know whether a prior notice exists, say so
+        # rather than assuming none. The app used to pre-answer this "No".
+        add_flag("warn", "⚠ VERIFY: check for prior notices to this counterparty on this matter — the "
+                         "prior-notice question is unanswered, so none has been assumed either way.")
+    elif prior.startswith("y"):
         add_flag("warn", "A prior notice exists. The lawyer should review its status — served, period "
                          "expired, complaint filed — alongside this draft; this notice's demand is "
                          "confined to the current instrument.")
@@ -130,16 +139,41 @@ def validate(kind: str, case: dict, docs=None) -> Report:
         chk("pass" if all(case.get(k) for k in ("dishonour_date", "dishonour_reason", "memo_date"))
             else "fail", "Dishonour date, reason and bank memo date present.")
         chk("pass" if amt else "fail", "Amount demanded stated in figures and words.")
-        if chq_total and amt and abs(chq_total - amt) > 0.5:
-            explained = bool(str(case.get("part_payment", "")).strip())
-            add_flag("warn" if explained else "crit",
-                     f"Demanded amount (INR {fmt_amount(amt)}) does not equal the cheque total "
-                     f"(INR {fmt_amount(chq_total)})."
-                     + (" A part-payment paragraph is present — confirm the arithmetic."
-                        if explained else " Record the part-payments, or correct the figure."))
-            if not explained:
-                r.blockers.append("The demand does not tie to the cheque total, and no part-payment "
-                                  "is recorded to explain it.")
+        # The demand must be the cheque total less money actually received after
+        # dishonour. Previously ANY text in the part-payment box — even "No
+        # part-payment has been made…" — counted as an explanation and turned
+        # this blocker into a warning, so a ₹4,48,000 invoice total went out as
+        # the demand on a ₹2,00,000 cheque.
+        paid = part_paid(case)
+        if paid is None:
+            r.blockers.append("A part-payment is described but its amount is not stated in figures. "
+                              "State the amount received (and its date) so the demand can be checked "
+                              "against the cheque.")
+        elif chq_total and amt is not None:
+            expected = round(chq_total - paid, 2)
+            if abs(expected - amt) > 0.5:
+                why = (f"the cheque total is INR {fmt_amount(chq_total)}" if not paid else
+                       f"the cheque total INR {fmt_amount(chq_total)} less the part-payment INR "
+                       f"{fmt_amount(paid)} is INR {fmt_amount(expected)}")
+                inv_total = _sum(rows(case, "invoices"), "amt")
+                hint = (" It equals the invoice total — a Section 138 notice demands the cheque "
+                        "amount, not the invoice." if inv_total and abs(inv_total - amt) < 0.5 else "")
+                r.blockers.append(f"The demand is INR {fmt_amount(amt)}, but {why}.{hint} A demand "
+                                  "that differs from the cheque amount can invalidate the notice.")
+                add_flag("crit", f"Demand INR {fmt_amount(amt)} does not match the cheque — {why}.")
+            chk("pass" if abs(expected - amt) <= 0.5 else "fail",
+                "Amount demanded equals the cheque amount less any part-payment received.")
+        if paid and paid >= chq_total > 0:
+            r.blockers.append("The part-payment recorded is equal to or more than the cheque total — "
+                              "there is nothing left to demand under Section 138. Check the figures.")
+        if str(case.get("jurisdiction", "")).strip():
+            add_flag("warn", f"Jurisdiction is stated as {case['jurisdiction']}. In a cheque case the court "
+                             "is generally where CEAT's bank branch that collected the cheque is located — "
+                             "confirm the cheque was presented through a branch there.")
+        else:
+            add_flag("info", "No jurisdiction paragraph was added (none was given). In a cheque case the "
+                             "court is generally where CEAT's collecting bank branch is — add it once that "
+                             "is confirmed.")
         # Each cheque carries its own cause of action and its own clock, so the
         # timing is checked cheque by cheque rather than once for the notice.
         memos = []          # (label, date, exact) — exact=False means the return
@@ -235,6 +269,47 @@ def validate(kind: str, case: dict, docs=None) -> Report:
         chk("pass" if case.get("interest") else "fail", "Interest rate stated (CEAT default 8% p.a.).")
         chk("pass", "Demand gives 10 days from receipt; civil and criminal language present.")
 
+        # Invoices not yet due on the notice date. The notice itself says payment
+        # was due 30 days from invoice, so demanding a later invoice as unpaid is
+        # self-contradicting. (This let ₹3,79,500 go out as "defaulted".)
+        nd = parse_date(case.get("notice_date"))
+        not_due = []
+        for row_ in rows(case, "soa"):
+            d0 = parse_date(row_.get("date"))
+            if d0 and nd and d0 + timedelta(days=30) > nd:
+                not_due.append((row_.get("ref") or "an invoice", d0 + timedelta(days=30),
+                                to_float(row_.get("amt")) or 0))
+        if not_due:
+            tot_nd = sum(x[2] for x in not_due)
+            listing = "; ".join(f"{a} (due {fmt_date(b)}, INR {fmt_amount(c)})" for a, b, c in not_due)
+            accel = re.search(r"accelerat|entire (?:balance|outstanding)|whole (?:balance|outstanding)",
+                              str(case.get("extra_notes") or ""), re.I)
+            msg = (f"{len(not_due)} invoice(s) totalling INR {fmt_amount(tot_nd)} were not yet due on the "
+                   f"notice date ({fmt_date(nd)}), on the notice's own 30-day terms: {listing}.")
+            if accel:
+                add_flag("crit", msg + " You noted an acceleration clause — the notice must cite it, or "
+                                       "the demand for these invoices contradicts paragraph 6.")
+            else:
+                r.blockers.append(msg + " Remove them from the demand, date the notice after they fall "
+                                        "due, or — if the terms make the whole balance payable on default "
+                                        "— say so (with the clause) under ‘Anything else’.")
+        ao = parse_date(case.get("as_on_date"))
+        if ao and nd and (nd - ao).days > 7:
+            add_flag("warn", f"The balance is stated as on {fmt_date(ao)}, {(nd - ao).days} days before the "
+                             "notice date. Confirm no payments or credit notes have come in since.")
+        pref = str(case.get("prior_ref") or "")
+        if str(case.get("prior", "")).lower().startswith("y") and pref:
+            overlap = [str(x.get("ref")) for x in rows(case, "soa") if str(x.get("ref") or "").strip()
+                       and str(x.get("ref")).strip() in pref]
+            if overlap:
+                add_flag("crit", f"Invoice(s) {', '.join(overlap)} are in this statement of account AND in the "
+                                 "earlier notice. The prior-notice paragraph says this demand excludes that "
+                                 "matter, but the full invoice is still claimed here — the lawyer should decide "
+                                 "whether to reduce the invoice by the amount covered earlier.")
+        if not str(case.get("interest_from") or "").strip():
+            add_flag("warn", "Interest is demanded without a start date, so it cannot be computed. Answer "
+                             "‘From when does interest run?’.")
+
     if kind == "consumer":
         paras = rows(case, "paras")
         incoming = str(case.get("incoming") or "")
@@ -252,6 +327,36 @@ def validate(kind: str, case: dict, docs=None) -> Report:
                              "included. Review — they can contradict each other.")
         if not str(case.get("inspection", "")).strip():
             add_flag("warn", "VERIFY: no inspection finding was supplied, so none is asserted in the reply.")
+        # The consumer's slot must hold the consumer. The model once filled it with
+        # CEAT's own name and Worli address, and nothing caught it.
+        cn = str(case.get("client_name") or "")
+        ca = str(case.get("client_address") or "")
+        cr = str(case.get("client_relation") or "")
+        if re.search(r"\bCEAT\b", cn, re.I) or re.search(r"RPG House|Annie Besant", ca, re.I) \
+                or re.match(r"\s*manufactur", cr, re.I):
+            r.blockers.append("The consumer's details are CEAT's own (name, address or ‘manufacturer’). "
+                              "The client is the consumer the advocate acts for — enter their name and "
+                              "address from the incoming notice.")
+        nd_, rd_ = parse_date(case.get("notice_date")), parse_date(case.get("reply_date"))
+        if nd_ and rd_ and nd_ > rd_:
+            r.blockers.append(f"The incoming notice is dated {fmt_date(nd_)}, after the reply date "
+                              f"{fmt_date(rd_)}. Check both dates.")
+        elif nd_ and rd_ and nd_ == rd_:
+            add_flag("crit", f"The incoming notice and the reply carry the same date ({fmt_date(nd_)}). "
+                             "Check the date printed on the incoming notice — it is usually earlier.")
+        # Block C must not contradict the para-wise answers.
+        status = DRAFT.dealer_status(case)
+        para_txt = " ".join(str(p.get("text") or "") for p in paras)
+        says_auth = re.search(r"(?<!not an )(?<!not our )authori[sz]ed\s+(?:CEAT\s+)?dealer", para_txt, re.I)
+        if status == "No" and says_auth and case.get("blk_c") is not False:
+            r.blockers.append("Contradiction: block C says the purchase was NOT from an authorised dealer, "
+                              "but the para-wise reply calls the dealer ‘authorised’. Correct one of them.")
+        if not str(case.get("dealer_authorised") or "").strip():
+            add_flag("warn", "Answer ‘Is that dealer an authorised CEAT dealer?’ — block C depends on it.")
+        for p in paras:
+            if not str(p.get("stance", "")).strip():
+                r.blockers.append(f"Para {p.get('n')} has no stance (admit / deny / not aware). Every "
+                                  "paragraph needs one.")
         chk("pass" if case.get("notice_date") else "fail",
             "“Re:” line cites the incoming notice's date.")
         chk("pass" if paras and (not numbered or len(paras) >= numbered) else "fail",
@@ -278,6 +383,26 @@ def validate(kind: str, case: dict, docs=None) -> Report:
     if kind in ("breach", "termination", "renewal", "fm", "price"):
         add_flag("warn", "VERIFY the clause number and any notice period against the actual signed "
                          "agreement — this app does not read clause numbering as authoritative.")
+
+    # A proprietorship is not a separate legal person: the notice must name the
+    # proprietor. The breach notice went out to "M/s Deccan Auto Tyres,
+    # Proprietor, M/s Deccan Auto Tyres" with no person named at all.
+    if kind != "consumer" and str(case.get("noticee_type", "")).startswith("Individual"):
+        nm, fm = str(case.get("noticee_name") or "").strip(), str(case.get("firm_name") or "").strip()
+        firmish = re.search(r"^\s*m/?s\b|\b(?:tyres?|traders?|enterprises?|agenc(?:y|ies)|motors|"
+                            r"automobiles?|& co|company|stores?|sales)\b", nm, re.I)
+        if nm and (firmish or (fm and nm.lower() == fm.lower())):
+            r.blockers.append(f"“{nm}” is a firm name, but the noticee is marked as a sole proprietor. Name "
+                              "the proprietor (the individual) — a proprietorship is not a separate legal "
+                              "person, and a notice to the firm alone can be challenged.")
+
+    if kind == "breach":
+        cited = re.findall(r"\d+(?:\.\d+)*[a-z]?", str(case.get("clause_no") or ""))
+        said = " ".join(str(case.get(k) or "") for k in ("obligation", "breach_facts", "consequences"))
+        unexplained = [c for c in cited if c not in said and len(cited) > 1]
+        if unexplained:
+            add_flag("warn", f"Clause(s) {', '.join(unexplained)} are cited as breached but not explained "
+                             "anywhere in the notice. Say what each requires, or drop it from the citation.")
 
     # ---- 5. figures and words must agree ---------------------------------
     # Compared on the number words alone: a missing "Rupees" prefix or "Only"
@@ -357,6 +482,30 @@ def validate(kind: str, case: dict, docs=None) -> Report:
                     f"notice addressed to {case.get('noticee_name')} — this discloses another customer's "
                     f"data and inflates the demand."
                 )
+
+    # ---- 8. read the notice as it will actually print ---------------------
+    # Nothing before this ever looked at the finished text — which is how
+    # broken sentences, a leftover [● inspection finding] and duplicated
+    # paragraphs reached signed notices.
+    try:
+        draft_notes: list = []
+        DRAFT.build(kind, case, draft_notes)
+        text = DRAFT.to_text(kind, case)
+        for n in draft_notes:
+            add_flag("crit" if n.startswith("Template drift") else "warn", n)
+        for l in C.lint(text):
+            add_flag("warn", "Read-through: " + l)
+        if re.search(r"\b(?:for|of|refund of|reimbursement of|compensation of|pay)\s+\d{4,}\b(?!\s*(?:km|kms|kilomet))",
+                     text, re.I):
+            add_flag("info", "Some amounts appear without ‘Rs.’/‘INR’ or Indian grouping (e.g. “32000”). "
+                             "Write them as “Rs. 32,000/-” in the answers.")
+        r.blanks = C.blanks(text)
+        if r.blanks:
+            add_flag("crit", f"{len(r.blanks)} detail(s) are still blank in the notice: "
+                             + "; ".join(r.blanks[:8]) + ". A notice with blanks cannot be downloaded as "
+                             "ready to issue — fill them, or download it as a marked Fill-in specimen.")
+    except Exception as e:                       # the checks must never crash the app
+        add_flag("warn", f"The finished-text read-through could not run ({type(e).__name__}: {e}).")
 
     return r
 

@@ -18,7 +18,7 @@ from . import skill_loader as SK
 from .config import llm_ready, llm_settings
 from .extract import Doc
 from .freetext import _cheques, _directors, _invoices, _noticee_type
-from .schema import LABELS, TABLE_COLS, label
+from .schema import FIELD_HELP, LABELS, TABLE_COLS, label
 from .words import find_amounts, find_dates, fmt_amount, iso, to_float
 
 SCALAR_KEYS = [k for k in LABELS if k not in TABLE_COLS]
@@ -31,6 +31,7 @@ class Found:
     missing: list = field(default_factory=list)     # labels the model could not find
     notes: list = field(default_factory=list)
     used_model: bool = False
+    model_failed: bool = False      # a key was set but the model call did not succeed
     error: str = ""
 
 
@@ -111,10 +112,42 @@ RETURN ONLY JSON, no prose, exactly this shape:
   "notes": ["<anything a lawyer should know about how you read the documents>"]
 }}
 
+WHAT THE FIELDS MEAN (use a key only for exactly this meaning):
+{chr(10).join(f"- {k}: {v}" for k, v in FIELD_HELP.items())}
+
+RULES FOR THIS NOTICE TYPE:
+{_KIND_RULES.get(kind, "- (none beyond the above)")}
+
 Valid scalar field keys: {", ".join(SCALAR_KEYS)}
 Valid table field keys, each an array of objects with exactly these columns:
 {json.dumps(cols, indent=1)}
 """
+
+
+# Things the model got wrong before these were spelled out.
+_KIND_RULES = {
+    "s138": (
+        "- The amount demanded is the dishonoured cheque amount (sum of the cheques) minus any "
+        "payment received AFTER dishonour. It is NEVER the invoice total, even when the cheque was "
+        "only a part-payment of the invoice.\n"
+        "- If the user says no part-payment was made, set part_paid to 0 and leave part_payment empty.\n"
+        "- 'part_payment' is a factual description of money received — never an instruction such as "
+        "'the demand is limited to …'."),
+    "consumer": (
+        "- The incoming notice is addressed TO CEAT by an advocate FOR a consumer. client_name, "
+        "client_relation and client_address describe that consumer — never CEAT Limited.\n"
+        "- notice_date is the date printed on the incoming notice, not today's date and not the "
+        "reply date.\n"
+        "- Set claim_date / inspection only from CEAT's own records the user gave you, never from "
+        "the consumer's allegations."),
+    "breach": (
+        "- For a sole proprietorship, noticee_name is the proprietor's personal name and firm_name "
+        "is the firm. If the proprietor's name is not given, leave noticee_name out and say so in "
+        "\"missing\" — do not copy the firm name into it."),
+    "recovery": (
+        "- The amount is the outstanding balance; it must equal the sum of the statement-of-account "
+        "rows you return."),
+}
 
 
 _GONE = ("decommissioned", "does not exist", "not found", "deprecated",
@@ -129,7 +162,14 @@ def _chat(client, role: str, **kw):
     try:
         return client.chat.completions.create(model=model, **kw)
     except Exception as e:
-        if not any(w in str(e).lower() for w in _GONE):
+        msg = str(e).lower()
+        # Reasoning models (gpt-5.x, o-series) reject temperature=0. That used to
+        # fail every call silently and drop the app back to regex-only reading.
+        if "temperature" in msg and ("unsupported" in msg or "not support" in msg
+                                     or "only the default" in msg):
+            kw.pop("temperature", None)
+            return client.chat.completions.create(model=model, **kw)
+        if not any(w in msg for w in _GONE):
             raise
         MODELS.available(force=True)
         retry, _ = MODELS.pick(role)
@@ -343,7 +383,11 @@ def deterministic(kind: str, case: dict, docs: list[Doc]) -> Found:
                     out.values[table_key] = built
                     out.evidence[table_key] = f"{d.name}, sheet “{t['sheet']}”, {len(built)} rows"
 
-                if cols["amt"] >= 0:
+                # Only a recovery notice demands the sum of its rows. In a Section 138
+                # notice the rows are invoices and the demand is the CHEQUE amount —
+                # summing the invoices here is how a ₹2,00,000 cheque became a
+                # ₹4,48,000 demand.
+                if cols["amt"] >= 0 and kind == "recovery":
                     total = sum(to_float(r[cols["amt"]]) or 0 for r in body if cols["amt"] < len(r))
                     if total:
                         # Name the column. "Outstanding", "Balance", "Debit" and "Net" are
@@ -412,7 +456,15 @@ def deterministic(kind: str, case: dict, docs: list[Doc]) -> Found:
             if clause:
                 out.values["clause_no"] = clause[1]
                 out.evidence["clause_no"] = d.name
-            if amts:
+            if kind == "s138":
+                # The demand is the cheque total, never "the largest amount in the
+                # file" — that is usually the invoice.
+                if chqs:
+                    tot = sum(to_float(c.get("amt")) or 0 for c in chqs)
+                    if tot:
+                        out.values.setdefault("amount", round(tot, 2))
+                        out.evidence.setdefault("amount", f"{d.name}: total of the cheque(s) read")
+            elif amts and kind == "recovery":
                 out.values.setdefault("amount", amts[0])
                 out.evidence.setdefault("amount", f"{d.name}: largest amount found")
             if dts:
@@ -457,7 +509,19 @@ def _plausible(key: str, value) -> bool:
     s = str(value or "").strip()
     if key in ("bank",) and (len(s) > 90 or _BAD_BANK.search(s)):
         return False
+    # The consumer's own details can never be CEAT's: the model once put
+    # "CEAT Limited … RPG House, Worli" into the consumer's name and address.
+    if key in ("client_name", "client_address") and re.search(
+            r"\bCEAT\b|RPG House|Annie Besant", s, re.I):
+        return False
+    # "No further part-payment … demand is limited to …" is not a part-payment.
+    if key == "part_payment" and _NO_PART.search(s):
+        return False
     return True
+
+
+_NO_PART = re.compile(r"\b(?:no|none|nil|not|without any)\b[^.]{0,30}part[- ]?pay|\blimited to\b",
+                      re.I)
 
 
 def _plausible_row(row: dict) -> bool:
@@ -630,7 +694,13 @@ def _prefer_filtered_rows(base: Found, merged: Found, case: dict, docs=None, kin
     # deterministic()'s own table_key. Checking the other field too (as this
     # used to) meant a "missing" floor for "soa" also stuffed identical rows
     # into "invoices" (or vice versa) on notice kinds that never asked for it.
-    table_key = "soa" if kind == "recovery" else ("prices" if kind == "price" else "invoices")
+    # Only a recovery notice's demand is the sum of its table. For Section 138 the
+    # invoice table is background and the demand is the cheque amount; running
+    # this there overwrote a correct ₹2,00,000 cheque demand with the ₹4,48,000
+    # invoice total whenever the cheque was a part-payment.
+    if kind != "recovery":
+        return merged
+    table_key = "soa"
     for key in (table_key,):
         m_rows = merged.values.get(key) or []
         b_rows = base.values.get(key) or []
@@ -750,6 +820,8 @@ def analyse(kind: str, case: dict, docs: list[Doc]) -> Found:
                ([_call_vision(kind, case, images)] if images else []):
         if got.error:
             merged.notes.append(f"Model call failed ({got.error}) — deterministic reading kept.")
+            merged.model_failed = True
+            merged.error = got.error
             continue
         for k, v in (got.values or {}).items():
             if v in (None, "", [], {}):
@@ -764,4 +836,30 @@ def analyse(kind: str, case: dict, docs: list[Doc]) -> Found:
                 merged.evidence[k] = got.evidence[k]
         merged.missing += [m for m in got.missing if m not in merged.missing]
         merged.notes += [n for n in got.notes if n not in merged.notes]
-    return _fix_noticees(case, with_typed(_prefer_filtered_rows(base, merged, case, docs, kind)))
+    return _s138_amount(kind, case, _fix_noticees(case, with_typed(
+        _prefer_filtered_rows(base, merged, case, docs, kind))))
+
+
+def _s138_amount(kind: str, case: dict, found: Found) -> Found:
+    """Section 138: the demand is the cheque total less any part-payment received.
+    If nothing states the demand, derive it; validate.py blocks any other figure."""
+    if kind != "s138":
+        return found
+    from .schema import rows as _rows
+    chq = found.values.get("cheques") or _rows(case, "cheques")
+    tot = sum(to_float(c.get("amt")) or 0 for c in chq if isinstance(c, dict))
+    if not tot:
+        return found
+    paid = to_float(found.values.get("part_paid") or case.get("part_paid")) or 0
+    want = round(tot - paid, 2)
+    have = to_float(found.values.get("amount"))
+    if have is None and not str(case.get("amount") or "").strip():
+        found.values["amount"] = want
+        found.evidence["amount"] = ("cheque total" + (f" less part-payment of INR {fmt_amount(paid)}"
+                                                      if paid else ""))
+    elif have is not None and abs(have - want) > 0.5:
+        found.notes.append(
+            f"The amount read as the demand (INR {fmt_amount(have)}) is not the cheque total less "
+            f"part-payments (INR {fmt_amount(want)}). A Section 138 demand must be the cheque amount "
+            f"— the check will stop the draft until this is resolved.")
+    return found

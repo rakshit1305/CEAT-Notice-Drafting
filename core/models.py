@@ -23,7 +23,19 @@ VISION_PREF = [
     "qwen/qwen3.6-27b",          # 5 images per request
     "qwen/qwen3.8-27b",          # 3 images per request
 ]
+# OpenAI-compatible accounts. Before this list existed, an unavailable configured
+# model on an OpenAI key fell through to "the alphabetically first model the key
+# can see" — which could be a tiny or retired model.
+OPENAI_TEXT_PREF = ["gpt-5.1", "gpt-5", "gpt-4.1", "gpt-4o"]
+OPENAI_VISION_PREF = ["gpt-5.1", "gpt-5", "gpt-4.1", "gpt-4o"]
 VISION_LIMITS = {"qwen/qwen3.6-27b": 5, "qwen/qwen3.8-27b": 3}
+_WEAK = ("mini", "nano", "8b", "20b", "instant", "small", "lite")
+
+
+def weak(model_id: str) -> bool:
+    """A small/fast tier — fine for chat, not for legal drafting."""
+    m = str(model_id or "").lower()
+    return any(w in m for w in _WEAK)
 DEFAULT_MAX_IMAGES = 3
 
 _cache: dict = {"at": 0.0, "ids": None, "error": ""}
@@ -78,7 +90,10 @@ def pick(role: str = "text") -> tuple[str, str]:
     """(model id, one line saying why). role is 'text' or 'vision'."""
     s = llm_settings()
     configured = s["text"] if role == "text" else s["vision"]
-    pref = TEXT_PREF if role == "text" else VISION_PREF
+    if s["name"] == "Groq":
+        pref = TEXT_PREF if role == "text" else VISION_PREF
+    else:
+        pref = OPENAI_TEXT_PREF if role == "text" else OPENAI_VISION_PREF
     have = available()
 
     if not have:
@@ -91,10 +106,11 @@ def pick(role: str = "text") -> tuple[str, str]:
         if m in have:
             return m, (f"“{configured}” is not available on this account — "
                        f"fell back to the best one that is")
-    any_left = sorted(have)
-    if any_left:
-        return any_left[0], f"none of the preferred models are available; using “{any_left[0]}”"
-    return configured, "the provider returned no models"
+    # Never guess an arbitrary model: keep the configured one and say so. If it
+    # really is unavailable the call fails visibly instead of silently running
+    # on whatever happens to sort first.
+    return configured, (f"“{configured}” is not in this account's model list and none of the "
+                        "preferred models are either — calls will use it and may fail")
 
 
 def max_images(model_id: str) -> int:
@@ -119,5 +135,5 @@ def status() -> dict:
     t, twhy = pick("text")
     v, vwhy = pick("vision")
     return dict(provider=s["name"], key=bool(s["key"]), reachable=bool(available()),
-                text=t, text_why=twhy, vision=v, vision_why=vwhy,
+                text=t, text_why=twhy, vision=v, vision_why=vwhy, weak=weak(t),
                 images=max_images(v), error=last_error(), versions=versions())
