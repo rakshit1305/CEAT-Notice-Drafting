@@ -17,11 +17,12 @@ import re as _re
 
 import streamlit as st
 
+from core import compose as COMPOSE
 from core import draft as DRAFT
 from core import models as MODELS
 from core import skill_loader as SK
 from core.analyse import analyse
-from core.config import MAX_UPLOAD_MB
+from core.config import MAX_UPLOAD_MB, llm_ready
 from core.extract import extract
 from core.schema import (CRITICAL, LABELS, TABLE_COLS, TYPES, is_filled, label, questions)
 from core.validate import missing_critical, missing_optional, validate
@@ -297,7 +298,10 @@ def default_case(kind: str) -> dict:
     c: dict = {"notice_date": dt.date.today().isoformat(),
                "mode": "BY SPEED POST",
                "signatory_name": name, "signatory_desig": desig,
-               "authority_confirmed": False, "prior": "No"}
+               "authority_confirmed": False, "prior": ""}
+    # "prior" used to be seeded "No" and was never marked as a default, so
+    # analysis could not overwrite it: a typed "yes, notice dated …" was silently
+    # ignored and every notice assumed no earlier notice existed.
     # These are seeded conveniences, not answers. Without this marker they read
     # as "already filled" and the date you actually picked, or the mode you
     # actually chose, could never overwrite them.
@@ -306,6 +310,10 @@ def default_case(kind: str) -> dict:
         c["interest"] = "8"
     if kind == "consumer":
         c["reply_date"] = dt.date.today().isoformat()
+        # For a reply, notice_date is the date on the INCOMING notice. Seeding it
+        # with today made every reply cite "Your Notice dated <today>".
+        c.pop("notice_date", None)
+        c["_defaults"] = [x for x in c["_defaults"] if x != "notice_date"] + ["reply_date"]
         c.update(blk_a=True, blk_b=True, blk_c=True)
     return c
 
@@ -419,6 +427,9 @@ with st.sidebar:
         if "fell back" in S["text_why"] or "fell back" in S["vision_why"]:
             st.caption("⚠️ A model named in `.env` is not available on this account; "
                        "the best available one is being used instead.")
+        if S.get("weak"):
+            st.warning(f"`{S['text']}` is a small/fast model tier. It fits wording and proof-reads "
+                       "notices far less reliably — set a full-size model in `.env`.", icon="⚠️")
     if st.button("Re-check models", use_container_width=True, key="recheck"):
         MODELS.available(force=True)
         st.rerun()
@@ -648,8 +659,9 @@ with left:
         with st.container(border=True, key=f"glass_q_{KIND}_{r['q'].id}"):
             ask(r)
 
-    st.caption("Nothing here is compulsory. Answer what you know, attach what you have — "
-               "anything still open is either asked for below or left as [● …] in the notice.")
+    st.caption("Nothing here is compulsory to start. Answer what you know, attach what you have — "
+               "anything still open shows as [● …] in the preview, and must be filled before the "
+               "notice can be downloaded as ready to issue.")
 
     with st.container(border=True, key=f"glass_docs_{KIND}"):
         st.markdown("**Documents attached**")
@@ -702,9 +714,23 @@ if go:
             if k in TABLE_COLS:
                 tk = f"{KIND}:{k}"
                 st.session_state.tver[tk] = st.session_state.tver.get(tk, 0) + 1
+        notes = list(found.notes)
+        # Fit the free-text answers into their sentences with the model. Every
+        # figure and date it returns is checked against the answer; anything it
+        # adds is rejected and the built-in fitter is used instead.
+        if llm_ready() and not found.model_failed:
+            notes += COMPOSE.llm_fit_case(KIND, CASE)
         rep = validate(KIND, CASE, list(DOCS.values()))
+        if found.model_failed:
+            rep.flags.insert(0, ("crit", "The AI model was NOT used — the call failed "
+                                         f"({found.error[:140]}). Everything was read by the built-in "
+                                         "parser only, so check every field before relying on this draft."))
+        # The model reads the finished notice like a reviewing lawyer. It never
+        # rewrites; what it finds goes to the review notes.
+        if rep.ok and llm_ready() and not found.model_failed:
+            rep.flags += COMPOSE.ai_review(KIND, DRAFT.to_text(KIND, CASE), CASE)
         st.session_state.report[KIND] = dict(applied=applied, evidence=evidence,
-                                             notes=found.notes, used_model=found.used_model,
+                                             notes=notes, used_model=found.used_model,
                                              rep=rep)
         st.session_state.drafted[KIND] = rep.ok
         if rep.ok:
@@ -762,28 +788,37 @@ with right:
                                 unsafe_allow_html=True)
                 opt = missing_optional(KIND, CASE)
                 if opt:
-                    st.caption("Separately, these are open and would show as [● …] in the draft — "
-                               "they do not block it: " + "; ".join(opt) + ".")
+                    st.caption("Separately, these are open and would show as [● …] in the preview — "
+                               "they must be filled before a clean download: " + "; ".join(opt) + ".")
         else:
-            specimen = st.toggle("Fill-in specimen", key=f"spec_{KIND}",
-                                 help="Marks the file as a specimen not ready to issue.")
-            fname = DRAFT.filename(KIND, CASE, specimen)
             text = DRAFT.to_text(KIND, CASE)
+            holes = COMPOSE.blanks(text)
+            specimen = st.toggle("Fill-in specimen", key=f"spec_{KIND}",
+                                 help="Download with the blanks visible, marked as a specimen that is "
+                                      "not ready to issue.")
+            fname = DRAFT.filename(KIND, CASE, specimen)
 
-            if rep.open_items:
-                st.warning("Open and shown as [● …] in the notice, nothing assumed: "
-                           + "; ".join(rep.open_items), icon="⚪")
+            if holes:
+                # The skill: the .docx is the clean notice only — no visible
+                # placeholders, except an explicitly requested, clearly marked
+                # fill-in specimen.
+                st.error(f"**{len(holes)} detail(s) still blank** — " + "; ".join(holes[:8])
+                         + ". Fill them in on the left and press the button again. Until then the notice "
+                           "can only be downloaded as a marked Fill-in specimen.", icon="⚪")
 
             st.markdown(sheet_html(text), unsafe_allow_html=True)
             st.caption(f"Save as  `{fname}`")
 
+            locked = bool(holes) and not specimen
             c1, c2 = st.columns(2)
-            c1.download_button("Download .docx", DRAFT.to_docx(KIND, CASE), fname,
+            c1.download_button("Download .docx", DRAFT.to_docx(KIND, CASE, specimen=specimen), fname,
                                "application/vnd.openxmlformats-officedocument."
                                "wordprocessingml.document",
-                               use_container_width=True, key=f"dl_{KIND}")
-            c2.download_button("Download .txt", text, fname.replace(".docx", ".txt"),
-                               "text/plain", use_container_width=True, key=f"dlt_{KIND}")
+                               use_container_width=True, key=f"dl_{KIND}", disabled=locked)
+            c2.download_button("Download .txt",
+                               ("FILL-IN SPECIMEN — NOT READY TO ISSUE\n\n" if specimen else "") + text,
+                               fname.replace(".docx", ".txt"),
+                               "text/plain", use_container_width=True, key=f"dlt_{KIND}", disabled=locked)
             with st.expander("Plain text — copy it straight out"):
                 st.code(text, language=None)
 
