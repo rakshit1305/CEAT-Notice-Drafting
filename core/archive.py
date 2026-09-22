@@ -57,7 +57,9 @@ def entries(root=None) -> list[dict]:
     base = _root(root)
     for r in rows:
         r["missing"] = not (base / r.get("folder", "") / f"{r.get('file', '')}.docx").exists()
-    return sorted(rows, key=lambda r: r.get("saved_at", ""), reverse=True)
+    # newest first; rows saved in the same second keep their register order
+    order = {id(r): i for i, r in enumerate(rows)}
+    return sorted(rows, key=lambda r: (r.get("saved_at", ""), order[id(r)]), reverse=True)
 
 
 def save(kind: str, case: dict, review_notes: int = 0, root=None, when=None) -> dict:
