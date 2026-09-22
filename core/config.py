@@ -33,6 +33,14 @@ REFERENCES = SKILL_DIR / "references"
 OUTPUT_DIR = ROOT / "drafts"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+# --- saved notices ----------------------------------------------------------
+# Where every drafted notice is kept (.docx + .txt + the case behind it, and a
+# register). Defaults to drafts/ beside app.py, which .gitignore already keeps
+# off GitHub. Point it at a OneDrive / SharePoint / Google Drive sync folder
+# or a shared network drive and the notices land there directly.
+SAVE_DIR = Path(_secret("NOTICE_SAVE_DIR", str(OUTPUT_DIR))).expanduser()
+AUTO_SAVE = _secret("NOTICE_AUTO_SAVE", "1").strip().lower() not in ("0", "false", "no", "off")
+
 # --- provider -------------------------------------------------------------
 # Groq is OpenAI-compatible, so the same client speaks to either.
 PROVIDER = _secret("LLM_PROVIDER", "groq").lower()
