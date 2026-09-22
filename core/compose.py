@@ -226,7 +226,19 @@ def fit_dealing(raw, case, subject: str, prefix: str = "That ") -> tuple[str, st
         body = f"{subject} {have} been {lower_first(t)}"
     elif fw in ROLE_NOUNS or t.lower().startswith(("a ", "an ")) and first_word(t[2:]) in ROLE_NOUNS:
         body = f"{subject} {have} been {_article(lower_first(t))}"
-    elif fw in ("you", "your", "we", "our", "noticee", "the", "it", "they"):
+    elif fw in ("they", "he", "she"):
+        # "they have been a CEAT dealer…" — the notice speaks of the noticee as
+        # "you" or "Noticee No. 1", never "they".
+        rest = t.split(None, 1)[1] if len(t.split(None, 1)) > 1 else ""
+        m = re.match(r"(have|has|are|is|were|was)\b(.*)", rest, re.I | re.S)
+        if m:
+            one = {"have": "has", "has": "has", "are": "is", "is": "is", "were": "was", "was": "was"}
+            many = {"have": "have", "has": "have", "are": "are", "is": "are", "were": "were", "was": "were"}
+            v = (many if subject == "you" else one)[m.group(1).lower()]
+            body = f"{subject} {v}{m.group(2)}"
+        else:
+            body = f"{subject} {rest}"
+    elif fw in ("you", "your", "we", "our", "noticee", "the", "it"):
         body = lower_first(t) if fw not in ("noticee",) else t
     else:
         body = lower_first(t)

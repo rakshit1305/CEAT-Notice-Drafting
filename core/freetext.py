@@ -20,7 +20,18 @@ ADDR_START = re.compile(
     r"^\s*(?:\d+[\-/A-Za-z]*\b|shop\b|plot\b|flat\b|no\.?\s*\d|h\.?\s*no\b|door\b|office\b|"
     r"unit\b|survey\b|gala\b|godown\b|building\b|bldg\b|block\b|floor\b|near\b|opp\b|"
     r"behind\b|sector\b|phase\b|khasra\b)", re.I)
-PROP = re.compile(r"^\s*(?:prop\.?|proprietor|partner|director)\b[:.,\s]*", re.I)
+# Words that introduce the person behind a firm. "partner"/"director" used to
+# match only in the singular, and "owned by" / "run by" not at all — so
+# "Shree Balaji Tyres, owned by Mr. Ramesh Patil" put "owned by Mr. Ramesh
+# Patil" into the noticee's name.
+PROP = re.compile(r"^\s*(?:(?:owned|run|managed|represented)\s+by|through\s+(?:its\s+)?"
+                  r"(?:sole\s+)?(?:proprietor|proprietress|partners?|directors?)|"
+                  r"prop(?:rietor|rietress|rietrix)?\.?|partners?|directors?)\b[:.,\s]*", re.I)
+# "a partnership firm", "a private limited company" — a description, not a name.
+DESCRIPTOR = re.compile(r"^\s*(?:a|an|the)?\s*(?:registered\s+)?(?:partnership(?:\s+firm)?|"
+                        r"private\s+limited(?:\s+company)?|public\s+limited(?:\s+company)?|"
+                        r"limited\s+company|company|llp|sole\s+proprietorship(?:\s+concern)?|"
+                        r"proprietorship(?:\s+concern)?|proprietary\s+concern)\s*$", re.I)
 PERSON = re.compile(r"\b(?:mr|mrs|ms|shri|smt|sri|dr|miss)\b\.?", re.I)
 FIRMY = re.compile(r"\b(?:m/s|enterprises?|traders?|trading|agenc(?:y|ies)|industries|tyres?|"
                    r"&\s*co|and co|pvt|private|limited|ltd|llp|corporation|company|"
@@ -83,6 +94,12 @@ def _split_party(parts: list[str]) -> tuple[str, str]:
 
 def _name_and_address(raw: str) -> tuple[str, str, str]:
     """(name, proprietorship concern, address) out of one typed block."""
+    # "Shree Balaji Tyres owned by Mr. X" / "Sharma Tyres (Prop. Mr. Y)" — break
+    # the person out into their own segment even without a comma.
+    raw = re.sub(r"\s*\(\s*((?:prop(?:rietor|rietress)?\.?|owned by|partners?)\b[^)]*)\)", r", \1", str(raw or ""),
+                 flags=re.I)
+    raw = re.sub(r"(?<=[A-Za-z.])\s+(?=(?:owned|run|managed)\s+by\b)", ", ", raw, flags=re.I)
+    raw = re.sub(r"(?<=[a-z])\s+(?=prop(?:rietor|rietress)?\b\.?\s)", ", ", raw, flags=re.I)
     ls = _lines(raw)
     if len(ls) >= 2:
         head, rest = ls[0], ls[1:]
@@ -100,7 +117,9 @@ def _name_and_address(raw: str) -> tuple[str, str, str]:
     if cut is None or cut == 0:
         cut = 1 if len(segs) > 1 else len(segs)
     head_parts, tail = segs[:cut], segs[cut:]
-    name, firm = _split_party([PROP.sub("", s).strip() for s in head_parts])
+    head_parts = [PROP.sub("", s).strip(" ()") for s in head_parts]
+    head_parts = [s for s in head_parts if s and not DESCRIPTOR.match(s)]
+    name, firm = _split_party(head_parts)
     return name, firm, ", ".join(tail)
 
 
@@ -108,7 +127,10 @@ def _rows_from_lines(raw: str, cols: list[str]) -> list[dict]:
     """'INV-1 | 02.05.2026 | 150000' one per line -> table rows."""
     out = []
     for line in _lines(raw):
-        parts = [p.strip() for p in re.split(r"\s*\|\s*|\t+|\s{2,}|,", line) if p.strip()]
+        # A comma followed by 2–3 digits is inside an Indian-format amount
+        # ("3,10,000"), not a column break — splitting there once turned a
+        # ₹3,10,000 invoice into an invoice of "10".
+        parts = [p.strip() for p in re.split(r"\s*\|\s*|\t+|\s{2,}|,(?!\d{2,3}\b)", line) if p.strip()]
         if len(parts) < 2:
             continue
         row = {c: "" for c in cols}
@@ -138,6 +160,13 @@ def _parse(kind: str, qid: str, raw: str, case: dict) -> dict:
 
     if qid == "addr":
         name, firm, addr = _name_and_address(t)
+        # A company or partnership is itself the noticee (Noticee No. 1); its
+        # directors/partners are read separately. Only a proprietorship splits
+        # into the person (noticee) and the concern.
+        multi_ = str(case.get("noticee_type", "")).startswith(("Company", "Partnership")) or \
+            bool(re.search(r"\bpartnership\b|\bpvt\b|private limited|\blimited\b|\bltd\b|\bllp\b", low))
+        if multi_ and firm:
+            name, firm = firm, ""
         if name:
             v["noticee_name"] = name
         if firm:
@@ -170,6 +199,11 @@ def _parse(kind: str, qid: str, raw: str, case: dict) -> dict:
         ds = find_dates(t)
         if ds and "dishonour_date" not in v:
             v["dishonour_date"] = ds[0]
+        # "returned on 28.07.2026 with bank memo of the same date"
+        if "memo_date" not in v and v.get("dishonour_date") and re.search(
+                r"(?:memo|intimation|advice|slip)[^.;\n]{0,30}same (?:date|day)|"
+                r"same (?:date|day)[^.;\n]{0,30}(?:memo|intimation|advice|slip)", t, re.I):
+            v["memo_date"] = v["dishonour_date"]
         reason = _quoted(t) or _after(t, r"\b(?:for the reason|reason|reasons?)\b", r"[.;\n]|vide")
         if reason:
             v["dishonour_reason"] = reason.strip(" ,;")
@@ -249,7 +283,7 @@ def _parse(kind: str, qid: str, raw: str, case: dict) -> dict:
         # Pipe/tab/two-space columns first; prose such as "Tax Invoice No. X
         # dated D for INR A" falls through to the cue-anchored reader, which
         # does not split an Indian-format amount on its own commas.
-        rows = _rows_from_lines(t, ["no", "date", "amt"]) or _invoices(t)
+        rows = _rows_from_lines(t, ["no", "date", "amt"]) or _invoices(t) or _invoices_loose(t)
         if rows:
             v["invoices"] = rows
 
@@ -446,6 +480,33 @@ def _invoices(t: str) -> list[dict]:
                    date=_d(dm.group(1)) if dm else "",
                    amt=_money(am.group(1)) if am else "")
         if row["date"] or row["amt"]:
+            out.append(row)
+    return out
+
+
+def _invoices_loose(t: str) -> list[dict]:
+    """In the invoice box itself, a line that opens with a reference such as
+    'INV/HYD/2026/771 dated … for Rs. …' is an invoice even without the word
+    'Invoice'. Same line-scoping as _invoices."""
+    out, seen = [], set()
+    for line in str(t or "").splitlines():
+        m = re.match(r"\s*(?:no\.?\s*)?([A-Za-z0-9][A-Za-z0-9/\-_.]*\d[A-Za-z0-9/\-_]*)", line)
+        if not m or parse_date(m.group(1)):
+            continue
+        no = m.group(1).strip(" .,;:")
+        if no.lower() in seen:
+            continue
+        tail = line[m.end():]
+        dm = (re.search(r"dated?\s+(" + DATE_RX + r")", tail, re.I) or re.search(r"(" + DATE_RX + r")", tail))
+        am = (re.search(r"(?:for|of|amounting to|sum of)\s*(?:INR|Rs\.?|\u20b9)\s*(" + MONEY_RX + r")", tail, re.I)
+              or re.search(r"(?:INR|Rs\.?|\u20b9)\s*(" + MONEY_RX + r")", tail, re.I))
+        if not am:
+            # "INV-11 02.06.2026 310000": a bare figure after the date
+            rest = tail[dm.end():] if dm else tail
+            am = re.search(r"(?<![\d.,/])(\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?|\d{3,}(?:\.\d{1,2})?)(?![\d.,/])", rest)
+        row = dict(no=no, date=_d(dm.group(1)) if dm else "", amt=_money(am.group(1)) if am else "")
+        if row["date"] or row["amt"]:
+            seen.add(no.lower())
             out.append(row)
     return out
 

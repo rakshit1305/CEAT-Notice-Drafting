@@ -426,8 +426,9 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                       "without complaint, against which you are liable to make payment:", n=len(inv))
             lead = lead.split(":")[0] + ":"
             li.append((lead, dict(head=["Invoice No.", "Invoice Date", "Amount (INR)"],
-                                  rows=[[r.get("no", "—"), fmt_date(r.get("date")) or "—",
-                                         fmt_amount(r.get("amt")) or "—"] for r in inv])))
+                                  rows=[[r.get("no") or blank("invoice no."),
+                                         fmt_date(r.get("date")) or blank("invoice date"),
+                                         fmt_amount(r.get("amt")) or blank("invoice amount")] for r in inv])))
         else:
             li.append("That the Company supplied Goods vide invoices received by you without complaint, "
                       "against which you are liable to make payment: " + blank("invoice particulars"))
