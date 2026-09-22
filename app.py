@@ -17,12 +17,13 @@ import re as _re
 
 import streamlit as st
 
+from core import archive as ARCHIVE
 from core import compose as COMPOSE
 from core import draft as DRAFT
 from core import models as MODELS
 from core import skill_loader as SK
 from core.analyse import analyse
-from core.config import MAX_UPLOAD_MB, llm_ready
+from core.config import AUTO_SAVE, MAX_UPLOAD_MB, SAVE_DIR, llm_ready
 from core.extract import extract
 from core.schema import (CRITICAL, LABELS, TABLE_COLS, TYPES, is_filled, label, questions)
 from core.validate import missing_critical, missing_optional, validate
@@ -329,13 +330,46 @@ def boot():
     ss.setdefault("tver", {})                  # "kind:table" -> int, bumps the editor's key
     ss.setdefault("history", [])               # drafts produced this session
     ss.setdefault("qfilter", "Everything")
+    ss.setdefault("autosave", AUTO_SAVE)
     for k in TYPES:
         ss.case.setdefault(k, default_case(k))
         ss.docs.setdefault(k, {})
         ss.drafted.setdefault(k, False)
 
 
+def apply_restore():
+    """Reopen a case (from History or Saved notices) at the top of a run, before
+    any widget exists. Done any later, the sidebar radio and the form widgets keep
+    their old state — the page flips back to the previous notice type and a date
+    widget overwrites the restored notice date."""
+    ss = st.session_state
+    pending = ss.pop("_restore", None)
+    if not pending:
+        return
+    kind, case = pending
+    ss.kind = kind
+    ss["kind_radio"] = kind
+    ss.case[kind] = case
+    ss.docs[kind] = {}
+    ss.drafted[kind] = False
+    ss.report.pop(kind, None)
+    for k in [k for k in list(ss.keys()) if str(k).startswith((f"w_{kind}_", f"spec_{kind}"))]:
+        del ss[k]
+    for t in TABLE_COLS:
+        tk = f"{kind}:{t}"
+        ss.tver[tk] = ss.tver.get(tk, 0) + 1
+
+
+def request_restore(kind: str, case: dict, msg: str):
+    st.session_state["_restore"] = (kind, copy.deepcopy(case))
+    st.session_state["_toast"] = msg
+    st.rerun()
+
+
 boot()
+apply_restore()
+if st.session_state.get("_toast"):
+    st.toast(st.session_state.pop("_toast"))
 KIND = st.session_state.kind
 CASE = st.session_state.case[KIND]
 DOCS = st.session_state.docs[KIND]
@@ -433,6 +467,13 @@ with st.sidebar:
     if st.button("Re-check models", use_container_width=True, key="recheck"):
         MODELS.available(force=True)
         st.rerun()
+
+    st.divider()
+    st.toggle("Save every notice automatically", key="autosave",
+              help="Each notice that passes the checks with no blanks is saved as .docx and .txt, "
+                   "with a row in the register. Drafts with blanks can be saved by hand, as a "
+                   "marked Fill-in specimen.")
+    st.caption(f"Saved notices go to `{SAVE_DIR}` — see the **Saved notices** tab.")
 
     st.divider()
     if st.button("Clear this case", use_container_width=True, key="clear"):
@@ -735,6 +776,19 @@ if go:
         st.session_state.drafted[KIND] = rep.ok
         if rep.ok:
             push_history(KIND, CASE, rep)
+            # Every notice that is ready to issue is kept. A draft with blanks is
+            # not auto-saved (it would fill the register with half-finished
+            # versions); it can be saved by hand as a marked specimen.
+            if st.session_state.autosave and not rep.blanks:
+                try:
+                    row = ARCHIVE.save(KIND, CASE, review_notes=len(rep.flags))
+                    st.session_state.report[KIND]["saved"] = row
+                    st.session_state["_toast"] = ("Already in Saved notices — nothing changed."
+                                                  if row.get("duplicate")
+                                                  else f"Saved: {row['file']}.docx")
+                except Exception as e:
+                    rep.flags.insert(0, ("crit", f"The notice could not be saved to {SAVE_DIR} "
+                                                 f"({type(e).__name__}: {e}). Download it now."))
     st.rerun()
 
 # ------------------------------------------------------------- the output --
@@ -746,12 +800,19 @@ with right:
     n_pass = sum(1 for c in rep.checks if c.state == "pass") if rep else 0
     n_tot = sum(1 for c in rep.checks if c.state != "na") if rep else 0
 
+    try:
+        SAVED = ARCHIVE.entries()
+    except Exception as e:                        # an unreadable folder must not break the page
+        SAVED, SAVED_ERR = [], f"{type(e).__name__}: {e}"
+    else:
+        SAVED_ERR = ""
     tabs = st.tabs(["Draft",
                     f"Review notes{f' ({n_flag})' if n_flag else ''}",
                     f"Checklist{f' ({n_pass}/{n_tot})' if rep else ''}",
                     "All fields",
                     f"History{f' ({len(st.session_state.history)})' if st.session_state.history else ''}",
-                    "Rules"])
+                    "Rules",
+                    f"Saved notices{f' ({len(SAVED)})' if SAVED else ''}"])
 
     # ---- 1. draft ---------------------------------------------------------
     with tabs[0]:
@@ -819,6 +880,23 @@ with right:
                                ("FILL-IN SPECIMEN — NOT READY TO ISSUE\n\n" if specimen else "") + text,
                                fname.replace(".docx", ".txt"),
                                "text/plain", use_container_width=True, key=f"dlt_{KIND}", disabled=locked)
+            saved = (R or {}).get("saved")
+            if saved:
+                st.caption(f"💾 Saved in **Saved notices** — `{saved['folder']}/{saved['file']}.docx`"
+                           + (" (this exact notice was already saved earlier)" if saved.get("duplicate") else ""))
+            else:
+                label_ = ("Save to Saved notices (as a marked Fill-in specimen)" if holes
+                          else "Save to Saved notices")
+                if st.button(label_, key=f"save_{KIND}", use_container_width=True):
+                    try:
+                        row = ARCHIVE.save(KIND, CASE, review_notes=len(rep.flags))
+                        R["saved"] = row
+                        st.session_state["_toast"] = ("Already in Saved notices." if row.get("duplicate")
+                                                      else f"Saved: {row['file']}.docx")
+                    except Exception as e:
+                        st.session_state["_toast"] = f"Could not save: {type(e).__name__}: {e}"
+                    st.rerun()
+
             with st.expander("Plain text — copy it straight out"):
                 st.code(text, language=None)
 
@@ -924,12 +1002,7 @@ with right:
                     st.markdown(f"<div class='ev'>{' · '.join(meta)}</div>", unsafe_allow_html=True)
                 c1, c2 = st.columns(2)
                 if c1.button("Restore this case", key=f"rest_{i}", use_container_width=True):
-                    st.session_state.kind = e["kind"]
-                    st.session_state.case[e["kind"]] = copy.deepcopy(e["case"])
-                    st.session_state.drafted[e["kind"]] = False
-                    st.session_state.report.pop(e["kind"], None)
-                    st.toast("Restored — press the button to re-check it.")
-                    st.rerun()
+                    request_restore(e["kind"], e["case"], "Restored — press the button to re-check it.")
                 c2.download_button("Download .txt",
                                    DRAFT.to_text(e["kind"], e["case"]),
                                    DRAFT.filename(e["kind"], e["case"]).replace(".docx", ".txt"),
@@ -948,3 +1021,77 @@ with right:
                 f"<b>{_h.escape(r.title)}</b><p>{_h.escape(r.body)}</p></div>",
                 unsafe_allow_html=True)
         st.info(SK.review_banner(), icon="⚖️")
+
+    # ---- 7. saved notices -------------------------------------------------
+    with tabs[6]:
+        st.caption(f"Every saved notice, newest first. Kept in `{SAVE_DIR}` as .docx and .txt, with the "
+                   "case behind each one so it can be reopened. The folder also has `register.csv`, "
+                   "which opens in Excel. Notices carry personal data — keep the folder access-controlled.")
+        if SAVED_ERR:
+            st.error(f"The saved-notices folder could not be read ({SAVED_ERR}).")
+        if not SAVED:
+            st.info("Nothing saved yet. Notices that pass the checks with no blanks are saved "
+                    "automatically when the sidebar switch is on; any draft can be saved with the "
+                    "button under it.", icon="💾")
+        else:
+            f1, f2, f3 = st.columns([2, 1.3, 1.3])
+            q = f1.text_input("Search", key="sv_q", placeholder="party, subject or file name",
+                              label_visibility="collapsed")
+            kinds_ = sorted({e["notice_type"] for e in SAVED})
+            pick_k = f2.multiselect("Type", kinds_, key="sv_k", placeholder="All types",
+                                    label_visibility="collapsed")
+            pick_s = f3.selectbox("Status", ["All", ARCHIVE.READY, ARCHIVE.SPECIMEN], key="sv_s",
+                                  label_visibility="collapsed")
+            ql = (q or "").strip().lower()
+            shown_ = [e for e in SAVED
+                      if (not ql or ql in " ".join([e.get("party", ""), e.get("subject", ""),
+                                                    e.get("file", "")]).lower())
+                      and (not pick_k or e["notice_type"] in pick_k)
+                      and (pick_s == "All" or e["status"] == pick_s)]
+            import pandas as pd
+            st.dataframe(pd.DataFrame([{
+                "Saved": e["saved_at"].replace("T", "  ")[:17],
+                "Type": e["notice_type"], "Party": e["party"], "Date": e["notice_date"],
+                "Amount (INR)": e["amount"], "Status": e["status"] + (" · file missing" if e["missing"] else ""),
+                "File": e["file"]} for e in shown_]),
+                use_container_width=True, hide_index=True, height=min(420, 38 + 35 * max(len(shown_), 1)))
+            st.caption(f"{len(shown_)} of {len(SAVED)} shown")
+
+            b1, b2 = st.columns(2)
+            b1.download_button("Register (Excel)", ARCHIVE.register_xlsx(shown_),
+                               f"CEAT_Saved_Notices_Register_{dt.date.today():%Y%m%d}.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True, key="sv_xlsx", disabled=not shown_)
+            b2.download_button("All shown as .zip", ARCHIVE.zip_of(shown_) if shown_ else b"",
+                               f"CEAT_Saved_Notices_{dt.date.today():%Y%m%d}.zip", "application/zip",
+                               use_container_width=True, key="sv_zip", disabled=not shown_)
+
+            if shown_:
+                st.divider()
+                sel = st.selectbox("Open one", range(len(shown_)), key="sv_pick",
+                                   format_func=lambda i: (f"{shown_[i]['saved_at'].replace('T', ' ')[:16]} · "
+                                                          f"{shown_[i]['notice_type']} · {shown_[i]['party']}"))
+                e = shown_[sel]
+                st.markdown(f"**{_h.escape(e['subject'])}**  \n"
+                            f"<span class='ev'>{_h.escape(e['status'])} · {e['review_notes']} review note(s) · "
+                            f"`{_h.escape(e['folder'])}/{_h.escape(e['file'])}`</span>",
+                            unsafe_allow_html=True)
+                if e["missing"]:
+                    st.warning("This notice's files are no longer in the folder — only its register row "
+                               "remains.", icon="⚠️")
+                else:
+                    o1, o2, o3 = st.columns(3)
+                    o1.download_button("Download .docx", ARCHIVE.file_bytes(e, "docx") or b"",
+                                       f"{e['file']}.docx",
+                                       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                       use_container_width=True, key=f"sv_d_{e['id']}")
+                    o2.download_button("Download .txt", ARCHIVE.file_bytes(e, "txt") or b"",
+                                       f"{e['file']}.txt", "text/plain",
+                                       use_container_width=True, key=f"sv_t_{e['id']}")
+                    if o3.button("Reopen this case", key=f"sv_r_{e['id']}", use_container_width=True):
+                        got = ARCHIVE.load_case(e)
+                        if got and got[0] in TYPES:
+                            request_restore(got[0], got[1], "Reopened — edit it and press the button to "
+                                                            "re-check. A changed notice saves as a new version.")
+                        else:
+                            st.error("The case file for this notice could not be read.")
