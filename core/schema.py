@@ -60,19 +60,20 @@ LABELS = {
     "blk_a": "Block A — principal to principal", "blk_b": "Block B — warranty procedure",
     "blk_c": "Block C — no privity",
     "agreement_name": "Agreement title", "agreement_date": "Agreement date",
-    "clause_no": "Clause", "obligation": "The obligation", "breach_facts": "Particulars of the breach",
+    "clause_no": "Clause", "obligation_clause": "Clause containing the obligation",
+    "attn_name": "Kind attention", "attn_desig": "Designation (kind attention)", "obligation": "The obligation", "breach_facts": "Particulars of the breach",
     "cure_period": "Cure period", "consequences": "Consequences if not cured",
     "subject_of": "What the agreement governs", "ground": "Ground",
     "facts": "Facts", "cure_given_date": "Cure period given on",
     "cure_lapsed_date": "Cure period lapsed on", "notice_period": "Notice period",
-    "effective_date": "Effective date", "dues": "Outstanding dues",
+    "effective_date": "Effective date", "price_change_pct": "Overall % change", "dues": "Outstanding dues",
     "wind_down": "Wind-down obligations", "expiry_date": "Expiry date",
     "intent": "Intent", "renewal_term": "Renewal term", "revised_terms": "Revised terms",
     "confirm_by": "Confirm acceptance by", "direction": "Direction",
     "fm_event": "The event", "fm_date": "Event began on", "affected": "Affected obligations",
     "impact": "Expected impact / duration", "mitigation": "Mitigation steps",
     "relief": "Relief sought", "reason": "Reason for the revision",
-    "prices": "Revised prices", "pre_orders": "Orders placed before the effective date",
+    "prices": "Revised prices", "quantities": "Affected quantities", "pre_orders": "Orders placed before the effective date",
 }
 
 # What each field MEANS. The model used to receive bare keys such as
@@ -114,6 +115,15 @@ FIELD_HELP = {
     "claim_date": "consumer reply: the date CEAT received the warranty claim, only if CEAT's own "
                   "records show one",
     "inspection": "consumer reply: CEAT's inspection finding, only if an inspection happened",
+    "price_change_pct": "price notice: the overall percentage revision, when no SKU-wise table is given",
+    "quantities": "force majeure: the affected deliveries — one row per month/period with scheduled, "
+                  "delivered, pending and the due date",
+    "obligation_clause": "termination: the clause that imposed the obligation breached — usually NOT "
+                         "the termination clause, which is clause_no",
+    "attn_name": "a contact person the notice is marked for the attention of. NOT a noticee: use this "
+                 "for a manager or director named only as a contact, e.g. in a force majeure, renewal "
+                 "or price notice",
+    "attn_desig": "that contact person's designation",
     "obligation": "breach: what the clause required the other party to do",
     "breach_facts": "breach: what actually happened — the particulars of the breach",
     "consequences": "breach: what CEAT will do if the breach is not cured",
@@ -128,6 +138,8 @@ TABLE_COLS = {
     "soa":      [("ref", "Invoice / reference"), ("date", "Document date"), ("amt", "Outstanding (INR)")],
     "prices":   [("sku", "Product / SKU"), ("old", "Existing price"), ("nw", "Revised price"),
                  ("pct", "% change")],
+    "quantities": [("period", "Month / period"), ("sched", "Scheduled"), ("done", "Delivered"),
+                   ("pend", "Pending"), ("due", "Due date")],
     "directors":[("name", "Director / partner name"), ("address", "Address")],
     "paras":    [("n", "Para"), ("stance", "Stance"), ("text", "Response")],
     "demands":  [("d", "Demand"), ("resp", "Response"), ("note", "Note")],
@@ -167,7 +179,9 @@ CRITICAL = {
     "renewal":     ["noticee_name", "noticee_address", "agreement_name", "expiry_date", "intent"],
     "fm":          ["noticee_name", "noticee_address", "agreement_name", "clause_no",
                     "fm_event", "fm_date"],
-    "price":       ["noticee_name", "noticee_address", "prices", "effective_date"],
+    # "prices" is not listed here: a price notice may state a SKU-wise table OR
+    # an overall percentage. validate.py requires one of the two.
+    "price":       ["noticee_name", "noticee_address", "effective_date"],
 }
 
 _PARTY = [
@@ -176,7 +190,7 @@ _PARTY = [
                ("Company + directors", "Company + directors", "Joint & several liability"),
                ("Partnership + partners", "Partnership firm + partners", "Joint & several liability")]),
     Q("addr", "Who is it addressed to — full name(s) and address?",
-      ["noticee_name", "noticee_address"], attach=True,
+      ["noticee_name", "noticee_address", "attn_name", "attn_desig"], attach=True,
       hint="For a sole proprietorship, give the proprietor's own name as well as the firm — a "
            "proprietorship is not a separate legal person.",
       ph="e.g. M/s Sharma Tyres, Prop. Mr. Rakesh Sharma, Shop 14, MG Road, Jaipur – 302001. "
@@ -298,8 +312,12 @@ QUESTIONS: dict[str, list[Q]] = {
           options=[("Breach", "Breach"), ("Convenience", "Convenience"), ("Expiry", "Expiry of term")]),
         Q("detail", "The detail: for a breach, what was required and what happened, with the cure dates. "
                     "Otherwise the notice period.",
-          ["obligation", "facts", "cure_given_date", "cure_lapsed_date", "notice_period"],
-          ph="e.g. required to clear dues within 30 days; cure notice 02.06.2026, lapsed 17.06.2026, still unpaid"),
+          ["obligation", "obligation_clause", "facts", "cure_given_date", "cure_lapsed_date",
+           "notice_period"],
+          hint="Name the clause that imposed the obligation — it is usually NOT the termination clause "
+               "given above. Writing 'under Clause 7.2' here keeps the two apart in the notice.",
+          ph="e.g. under Clause 7.2, required to clear dues within 30 days; cure notice 02.06.2026, "
+             "lapsed 17.06.2026, still unpaid"),
         Q("eff", "Effective from what date?", ["effective_date"], kind="date"),
         Q("wind", "What must they do on the way out — dues, stock, signage?", ["wind_down", "dues"],
           ph="e.g. clear dues of INR 3,20,000, return Company property and stock, cease use of CEAT marks"),
@@ -325,6 +343,10 @@ QUESTIONS: dict[str, list[Q]] = {
         Q("impact", "What can't be performed, for how long, and what is being done about it?",
           ["affected", "impact", "mitigation"],
           ph="e.g. despatches suspended; 6–8 weeks; production shifting to Halol"),
+        Q("qty", "The affected quantities, if they can be listed", ["quantities"], attach=True,
+          hint="One line per month or delivery: period | scheduled | delivered | pending | due "
+               "date. A table is far harder to dispute later than the same figures in a sentence.",
+          ph="September 2026 | 400 | 160 | 240 | 25.09.2026"),
         Q("relief", "What are you asking them to do?", ["relief"],
           ph="e.g. extend the delivery timelines accordingly"),
     ] + _SEND,
@@ -334,7 +356,9 @@ QUESTIONS: dict[str, list[Q]] = {
           ["agreement_name", "agreement_date", "clause_no", "reason"], attach=True,
           ph="e.g. Dealership Agreement dated 04.03.2025, Clause 9.3; movement in raw-material costs"),
         Q("prices", "What are the revised prices? Upload the price list, or list them.",
-          ["prices"], attach=True,
+          ["prices", "price_change_pct"], attach=True,
+          hint="One line per product: SKU | existing price | revised price | % change. If only an "
+               "overall percentage has been agreed, state that instead.",
           ph="product / SKU | existing price | revised price | % change"),
         Q("eff", "Effective from what date?", ["effective_date"], kind="date"),
         Q("pre", "What happens to orders already placed before that date?", ["pre_orders"],

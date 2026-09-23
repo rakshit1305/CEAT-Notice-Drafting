@@ -396,6 +396,122 @@ def validate(kind: str, case: dict, docs=None) -> Report:
                               "the proprietor (the individual) — a proprietorship is not a separate legal "
                               "person, and a notice to the firm alone can be challenged.")
 
+    # ---- the mandatory checklists of the four non-standard types ----------
+    nd0 = parse_date(case.get("notice_date"))
+    if kind == "termination":
+        ocl = str(case.get("obligation_clause") or "").strip()
+        tcl = str(case.get("clause_no") or "").strip()
+        if str(case.get("ground", "")).startswith("Breach"):
+            chk("pass" if ocl else "fail", "The clause imposing the obligation is identified.")
+            if ocl and tcl and ocl == tcl:
+                add_flag("warn", f"The obligation and the right to terminate are both cited to Clause "
+                                 f"{tcl}. In most agreements these are different clauses — check.")
+            lapsed = parse_date(case.get("cure_lapsed_date"))
+            if lapsed and nd0 and (nd0 - lapsed).days > 45:
+                add_flag("crit", f"The cure period lapsed on {fmt_date(lapsed)}, {(nd0 - lapsed).days} "
+                                 "days before this notice. A long gap lets the other party argue CEAT "
+                                 "carried on dealing with them and waived the breach — consider a fresh "
+                                 "cure notice first.")
+        eff = parse_date(case.get("effective_date"))
+        if eff and nd0 and eff < nd0:
+            r.blockers.append(f"Termination is stated to take effect on {fmt_date(eff)}, before the "
+                              f"notice date {fmt_date(nd0)}. An agreement cannot be terminated "
+                              "retrospectively by notice.")
+        elif eff and nd0 and eff == nd0:
+            add_flag("warn", "Termination takes effect on the date of the notice itself. Most agreements "
+                             "run the effect from receipt — confirm the clause allows same-day effect.")
+        add_flag("warn", "⚠ VERIFY the termination clause, the required notice period and any cure "
+                         "requirement against the signed agreement.")
+        # A fraud/audit-based termination that counts items should annex them.
+        fct = str(case.get("facts") or "")
+        m_ = re.search(r"\b(\d{2,})\s+(claims?|invoices?|items?|instances?|transactions?|entries)\b",
+                       fct, re.I)
+        if m_ and not re.search(r"schedule|annexure|enclosed|annexed", fct + str(case.get("extra_notes") or ""),
+                                re.I):
+            add_flag("warn", f"The facts rely on {m_.group(1)} {m_.group(2).lower()} but no schedule of "
+                             "particulars is mentioned. For a termination of this kind the particulars "
+                             "(reference, date, amount, finding) are the evidence — annex them as a "
+                             "Schedule and refer to it here.")
+
+        # the same content in two paragraphs
+        facts_t = re.sub(r"\W+", " ", str(case.get("facts") or "")).lower()
+        wind_t = re.sub(r"\W+", " ", str(case.get("wind_down") or "")).lower()
+        shared = [w for w in set(facts_t.split()) & set(wind_t.split()) if len(w) > 6]
+        if len(shared) >= 8:
+            add_flag("warn", "The breach facts and the wind-down answer overlap heavily, so the notice "
+                             "may say the same thing twice. Keep what happened in the facts and what "
+                             "they must now do in the wind-down.")
+
+    if kind == "fm":
+        fmd = parse_date(case.get("fm_date"))
+        if fmd and nd0:
+            gap = (nd0 - fmd).days
+            if gap < 0:
+                r.blockers.append("The force majeure event is dated after this notice. Check the dates.")
+            else:
+                add_flag("warn" if gap > 7 else "info",
+                         f"The event began {fmt_date(fmd)} and this notice is dated {fmt_date(nd0)} — "
+                         f"{gap} day(s) later. ⚠ VERIFY the notice deadline in Clause "
+                         f"{case.get('clause_no') or '—'}: force majeure claims are frequently lost for "
+                         "late or non-conforming notice.")
+        qty = rows(case, "quantities")
+        if qty:
+            nums = {re.sub(r"[^\d]", "", str(r.get(k) or "")) for r in qty for k in ("sched", "done", "pend")}
+            aff_nums = set(re.findall(r"\d{2,}", str(case.get("affected") or "")))
+            if len(nums & aff_nums) >= 2:
+                add_flag("info", "The affected-obligations answer repeats figures that now appear in the "
+                                 "quantities table. Trimming the sentence keeps the notice tighter; the "
+                                 "table is the harder record.")
+        else:
+            add_flag("info", "No quantities table was given. If the affected deliveries can be listed "
+                             "(period, scheduled, delivered, pending, due date), a table is much harder "
+                             "to dispute later than the same figures in a sentence.")
+        for f_, what in (("fm_event", "the event"), ("affected", "the affected obligations"),
+                         ("impact", "the expected impact or duration"),
+                         ("mitigation", "the mitigation steps"), ("relief", "the relief sought")):
+            chk("pass" if str(case.get(f_) or "").strip() else "fail", f"Notice states {what}.")
+
+    if kind == "renewal":
+        exp = parse_date(case.get("expiry_date"))
+        if case.get("intent") == "Do not renew":
+            per = str(case.get("notice_period") or "").strip()
+            m = re.search(r"(\d{1,3})\s*(day|month)", per, re.I)
+            if m and exp and nd0:
+                days = int(m.group(1)) * (30 if m.group(2).lower().startswith("month") else 1)
+                if (exp - nd0).days < days:
+                    r.blockers.append(
+                        f"The agreement needs {per} notice of non-renewal, but only "
+                        f"{(exp - nd0).days} day(s) remain to expiry on {fmt_date(exp)}. A late "
+                        "non-renewal notice is usually ineffective — check the clause before sending.")
+            elif not per:
+                add_flag("warn", "No notice period was given for the non-renewal. ⚠ VERIFY the period "
+                                 "the clause requires — a late non-renewal notice is often time-barred.")
+        else:
+            by = parse_date(case.get("confirm_by"))
+            if by and exp and by > exp:
+                r.blockers.append(f"Acceptance is asked for by {fmt_date(by)}, after the Agreement "
+                                  f"expires on {fmt_date(exp)}. Bring the confirm-by date forward.")
+            if by and nd0 and by < nd0:
+                r.blockers.append("The confirm-by date is before the notice date.")
+            chk("pass" if by else "fail", "A date to confirm acceptance is given.")
+
+    if kind == "price":
+        eff = parse_date(case.get("effective_date"))
+        if eff and nd0 and eff <= nd0:
+            add_flag("crit", "The revised prices take effect on or before the notice date. A price "
+                             "revision normally needs notice before it applies — check the clause.")
+        elif eff and nd0 and (eff - nd0).days < 30:
+            add_flag("warn", f"Only {(eff - nd0).days} day(s) between this notice and the effective "
+                             "date. ⚠ VERIFY the notice period the price-variation clause requires.")
+        if not rows(case, "prices") and not str(case.get("price_change_pct") or "").strip():
+            r.blockers.append("Revised prices — give the product-wise table (SKU | existing | revised | "
+                              "% change), or at least the overall percentage. The notice cannot state a "
+                              "price revision without one of them.")
+        chk("pass" if (rows(case, "prices") or case.get("price_change_pct")) else "fail",
+            "Revised prices stated, with old versus new or the percentage.")
+        chk("pass" if str(case.get("pre_orders") or "").strip() else "fail",
+            "Treatment of orders already placed is addressed.")
+
     if kind == "breach":
         cited = re.findall(r"\d+(?:\.\d+)*[a-z]?", str(case.get("clause_no") or ""))
         said = " ".join(str(case.get(k) or "") for k in ("obligation", "breach_facts", "consequences"))

@@ -87,6 +87,7 @@ def extract(name: str, data: bytes) -> Doc:
         elif ext in ("xlsx", "xls", "xlsm"):
             d.kind = "tables"
             d.tables = _excel_tables(data)
+            d.note = _formula_note(data, ext, d.tables) or d.note
         elif ext == "pdf":
             d.text, pages, has_text = _pdf_text(data)
             if not has_text:
@@ -134,6 +135,38 @@ def _excel_tables(data: bytes) -> list[dict]:
         if rows:
             out.append(dict(sheet=str(sheet), rows=rows))
     return out
+
+
+def _formula_note(data: bytes, ext: str, tables: list[dict]) -> str:
+    """A sheet written by a script holds formulas with no saved result. Excel
+    files are read for their saved values, so those cells arrive empty — which
+    looks to everyone like the app simply ignored the figures."""
+    if ext != "xlsx":
+        return ""
+    try:
+        from openpyxl import load_workbook
+        raw = load_workbook(io.BytesIO(data), data_only=False, read_only=True)
+        cached = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+        formulas = empty = 0
+        for ws in raw.worksheets:
+            cs = cached[ws.title]
+            for row in ws.iter_rows():
+                for c in row:
+                    if isinstance(c.value, str) and c.value.startswith("="):
+                        formulas += 1
+                        if cs.cell(c.row, c.column).value in (None, ""):
+                            empty += 1
+        raw.close()
+        cached.close()
+    except Exception:
+        return ""
+    if not formulas:
+        return ""
+    if empty:
+        return (f"{empty} of this workbook's {formulas} formula cell(s) have no saved result, so those "
+                "figures read as EMPTY here. Open the file in Excel and save it, or type the figures "
+                "into the answer box — otherwise they cannot reach the notice.")
+    return f"{formulas} cell(s) are formulas; their saved results were read."
 
 
 def _pdf_text(data: bytes) -> tuple[str, int, bool]:

@@ -85,9 +85,36 @@ def capacity(case) -> str:
     return "Partner" if str(case.get("noticee_type", "") or "").startswith("Partnership") else "Director"
 
 
-def noticee_block(case) -> str:
+# In these notices CEAT asserts nothing against anyone personally — it invokes a
+# clause or gives information. A company's director is a contact, not a noticee;
+# naming him as one implies he is personally answerable. A partnership is
+# different: the partners are parties to the agreement and stay as noticees.
+CONTACT_ONLY = ("fm", "price", "renewal")
+
+
+def contact_line(case, kind: str = "") -> str:
+    who = str(case.get("attn_name") or "").strip()
+    desig = str(case.get("attn_desig") or "").strip()
+    if not who:
+        return ""
+    return "Kind Attn.: " + who + (f", {desig}" if desig else "")
+
+
+def noticee_block(case, kind: str = "") -> str:
     lines = []
-    if multi(case):
+    company_only = (kind in CONTACT_ONLY
+                    and str(case.get("noticee_type", "")).startswith("Company"))
+    if multi(case) and company_only:
+        lines += [V(case, "noticee_name"), V(case, "noticee_address")]
+        attn = contact_line(case, kind)
+        named = [d.get("name") for d in rows(case, "directors") if str(d.get("name", "")).strip()]
+        if not attn and named:
+            d0 = rows(case, "directors")[0]
+            cap0 = str(d0.get("capacity") or "").strip()
+            attn = "Kind Attn.: " + str(d0.get("name")) + (f", {cap0}" if cap0 else "")
+        if attn:
+            lines += ["", attn]
+    elif multi(case):
         lines += ["Noticee No. 1", V(case, "noticee_name"), V(case, "noticee_address")]
         for i, d in enumerate(rows(case, "directors"), start=2):
             if str(d.get("name", "")).strip():
@@ -111,6 +138,9 @@ def noticee_block(case) -> str:
         if str(case.get("firm_name", "")).strip():
             lines.append("Proprietor, " + case["firm_name"])
         lines.append(V(case, "noticee_address"))
+        attn = contact_line(case, kind)
+        if attn:
+            lines += ["", attn]
     return "\n".join(lines)
 
 
@@ -258,6 +288,17 @@ def _final(s: str) -> str:
     return C.tidy(_clauses(s))
 
 
+def _pct(row: dict) -> str:
+    """The % change cell: as given, or worked out from the two prices."""
+    p = str(row.get("pct") or "").strip()
+    if p:
+        return p if p.endswith("%") else p + "%"
+    o, n = to_float(row.get("old")), to_float(row.get("nw"))
+    if o and n:
+        return f"{(n - o) / o * 100:+.1f}%"
+    return "—"
+
+
 def reg_city(ro: str) -> str:
     m = re.search(r"([A-Z][a-z]+)\s*[–-]\s*\d{6}", ro)
     return m.group(1) if m else "Mumbai"
@@ -352,6 +393,12 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
             collected.append(msg)
 
     multi_ = multi(case)
+    if (kind in CONTACT_ONLY and str(case.get("noticee_type", "")).startswith("Company")
+            and [d for d in rows(case, "directors") if str(d.get("name", "")).strip()]):
+        note("The named individual is shown as “Kind Attn.”, not as a noticee. This notice asserts "
+             "nothing against anyone personally, and naming a director as a noticee implies he is "
+             "personally answerable. Say so under ‘Anything else’ if you do intend to address him "
+             "as a party.")
     if kind == "consumer":
         head.append(Block("addr", text="To,\n" + V(case, "advocate_name", "advocate") + ", Advocate\n"
                                        + V(case, "advocate_address", "advocate's address")))
@@ -363,7 +410,7 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
         head.append(Block("p", text=D(case, "notice_date")))
         head.append(Block("stamp", text=case.get("mode") or MODES_DEFAULT, bold=True))
         head.append(Block("stamp", text="WITHOUT PREJUDICE", bold=True, underline=True))
-        head.append(Block("addr", text="To,\n" + noticee_block(case)))
+        head.append(Block("addr", text="To,\n" + noticee_block(case, kind)))
 
     # ------------------------------------------------------------ s138 ---
     if kind == "s138":
@@ -766,9 +813,14 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
             "risk as to the costs and consequences thereof.")))
 
     # -------------------------------------------- contract notice types ---
+    # These four (termination, renewal, force majeure, price) are NON-STANDARD in
+    # the skill — no CEAT sample exists yet — so their wording comes from the
+    # reference file's own template and every answer is fitted into it rather
+    # than pasted mid-sentence.
     else:
         agr = V(case, "agreement_name", "agreement title")
         dt = D(case, "agreement_date")
+        cl = V(case, "clause_no", "clause")
         if kind == "breach":
             av = dict(AGREEMENT_NAME=agr, AGREEMENT_DATE=dt, CLAUSE_NO=V(case, "clause_no", "clause"),
                       CURE_PERIOD=V(case, "cure_period", "cure period"))
@@ -814,94 +866,212 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
             li.append(TP("breach", "This notice is issued without prejudice",
                          "This notice is issued without prejudice to the Company's rights and remedies, all of "
                          "which are expressly reserved."))
-        else:
-            li.append("CEAT Limited (“the Company”) is a Public Limited Company incorporated under the Companies "
-                      f"Act, 1956, having its Registered Office at {ro}, engaged in the manufacture and sale of "
-                      "Tyres, Tubes and Flaps.")
-            F = lambda key, lbl=None: (C.fit_inline(case.get(key)) or blank(lbl or label(key).lower()))
-            if kind == "termination":
-                subject = f"Notice of Termination of {agr} dated {dt}."
-                li.append(f"The Company and you entered into {agr} dated {dt} (“the Agreement”), governing "
-                          f"{F('subject_of','subject of the agreement')}.")
-                g = str(case.get("ground", ""))
-                if g == "Convenience":
-                    li.append(f"In terms of Clause {V(case,'clause_no','clause')}, the Company is entitled to "
-                              f"terminate the Agreement by giving {F('notice_period','notice period')} notice.")
-                elif g == "Expiry":
-                    li.append(f"In terms of Clause {V(case,'clause_no','clause')}, the Agreement stands "
-                              "terminated upon expiry of its term.")
-                else:
-                    t = (f"In terms of Clause {V(case,'clause_no','clause')}, you were required to "
-                         f"{F('obligation','the obligation')}. You have failed to do so, as "
-                         f"{F('facts','facts of the breach')}.")
-                    if str(case.get("cure_given_date", "")).strip():
-                        t += f" This is despite the cure period given on {fmt_date(case['cure_given_date'])}."
-                    li.append(t)
-                li.append(f"Accordingly, the Company hereby gives notice of termination of the Agreement under "
-                          f"Clause {V(case,'clause_no','clause')}, with effect from {D(case,'effective_date')}.")
-                w = "Upon termination, you are called upon to "
-                if str(case.get("dues", "")).strip():
-                    w += f"clear all outstanding dues of {M(case,'dues')}, and "
-                li.append(w + F("wind_down", "wind-down obligations") + ".")
-            elif kind == "renewal":
-                renew = case.get("intent") != "Do not renew"
-                subject = f"Notice of {'Renewal' if renew else 'Non-Renewal'} of {agr} dated {dt}."
-                li.append(f"The Company and you are parties to {agr} dated {dt} (“the "
-                          f"Agreement”), which is due to expire on {D(case,'expiry_date')}.")
-                if renew:
-                    terms = C.fit_inline(case.get("revised_terms"))
-                    li.append(f"In terms of Clause {V(case,'clause_no','clause')}, the Company hereby conveys "
-                              f"its intention to renew the Agreement for a further term of "
-                              f"{F('renewal_term','renewal term')}"
-                              + (f" on the following revised terms: {terms}" if terms else " on the existing terms")
-                              + f". Kindly confirm your acceptance on or before {D(case,'confirm_by','confirm-by date')}.")
-                else:
-                    li.append(f"In terms of Clause {V(case,'clause_no','clause')}, the Company hereby gives "
-                              "notice that it does NOT intend to renew the Agreement, which shall accordingly "
-                              f"stand expired on {D(case,'expiry_date')} without further notice.")
-                    w = "Upon expiry, you are called upon to "
-                    if str(case.get("dues", "")).strip():
-                        w += f"clear outstanding dues of {M(case,'dues')}, and "
-                    li.append(w + F("wind_down", "wind-down obligations") + ".")
-            elif kind == "fm":
-                subject = f"Notice invoking Force Majeure under {agr} dated {dt}."
-                li.append(f"The Company and you are parties to {agr} dated {dt} (“the Agreement”), which "
-                          f"contains a force majeure provision at Clause {V(case,'clause_no','clause')}.")
-                li.append(f"On/from {D(case,'fm_date','event date')}, {F('fm_event','the event')} has "
-                          "occurred, being an event beyond the Company's reasonable control within the meaning "
-                          f"of Clause {V(case,'clause_no','clause')}.")
-                li.append("As a direct consequence, the Company is prevented/delayed from performing "
-                          f"{F('affected','affected obligations')}. The expected impact/duration is "
-                          f"{F('impact','impact / duration')}.")
-                li.append("The Company is taking the following steps to mitigate the effect of the said event: "
-                          f"{F('mitigation','mitigation steps')}.")
-                li.append(f"Accordingly, in terms of Clause {V(case,'clause_no','clause')}, the Company hereby "
-                          "invokes force majeure and calls upon you to treat the affected obligations as "
-                          f"suspended for the duration of the event, and to {F('relief','relief sought')}.")
-            elif kind == "price":
-                subject = f"Notice of Price Revision effective {D(case,'effective_date')}."
-                basis = (f"Clause {case['clause_no']}" if str(case.get("clause_no", "")).strip()
-                         else "the Company's right to revise prices")
-                li.append(f"The Company supplies its Tyres, Tubes and Flaps (“Goods”) to you "
-                          f"under {agr}" + (f" dated {fmt_date(case['agreement_date'])}"
-                                            if str(case.get("agreement_date", "")).strip() else "") + ".")
-                li.append(f"On account of {F('reason','reason for the revision')}, and in terms of {basis}, "
-                          "the Company hereby gives notice of a revision in the prices of the Goods with effect "
-                          f"from {D(case,'effective_date')}.")
-                prows = [r for r in rows(case, "prices") if str(r.get("sku", "")).strip()]
-                if prows:
-                    li.append(("The revised prices are as follows:",
-                               dict(head=["Product / SKU", "Existing Price", "Revised Price", "% change"],
-                                    rows=[[r.get("sku"), fmt_amount(r.get("old")) or "—",
-                                           fmt_amount(r.get("nw")) or "—", r.get("pct", "—")] for r in prows])))
-                else:
-                    li.append("The revised prices are as follows: " + blank("price table"))
-                li.append(f"Orders placed and accepted before {D(case,'effective_date')} shall be "
-                          f"{F('pre_orders','treatment of pre-existing orders')}. All orders on or after "
-                          f"{D(case,'effective_date')} shall be at the revised prices.")
-                li.append("All other terms and conditions of supply remain unchanged.")
-            li.append("This notice is issued without prejudice to the Company's rights and remedies, all of "
+        elif kind == "termination":
+            intro = TP("termination", "CEAT Limited (\"the Company\") is a Public Limited Company",
+                       f"CEAT Limited (“the Company”) is a Public Limited Company incorporated under the "
+                       f"Companies Act, 1956, having its Registered Office at {ro}, engaged in the "
+                       f"manufacture and sale of Tyres, Tubes and Flaps.")
+            li.append(intro)
+            subject = f"Notice of Termination of {agr} dated {dt}."
+            li.append(TP("termination", "The Company and you entered into",
+                         "The Company and you entered into {{AGREEMENT_NAME}} dated {{AGREEMENT_DATE}} "
+                         "(\"the Agreement\"), governing {{SUBJECT_OF_AGREEMENT}}.",
+                         dict(AGREEMENT_NAME=agr, AGREEMENT_DATE=dt,
+                              SUBJECT_OF_AGREEMENT=C.fit_inline(case.get("subject_of"))
+                              or blank("what the agreement governs"))))
+            g = str(case.get("ground", ""))
+            if g == "Convenience":
+                li.append(f"In terms of Clause {cl}, the Company is entitled to terminate the Agreement "
+                          f"by giving {C.fit_inline(case.get('notice_period')) or blank('notice period')} "
+                          "notice, and has elected to do so.")
+            elif g == "Expiry":
+                li.append(f"In terms of Clause {cl}, the Agreement stands terminated upon expiry of its term.")
+            else:
+                # The obligation clause is its own field: citing the termination
+                # clause as the source of the obligation (12.1(a) instead of 7.2)
+                # misstates the agreement.
+                ocl = str(case.get("obligation_clause") or "").strip()
+                if not ocl:
+                    ocl = str(case.get("clause_no") or "").strip()
+                    if ocl:
+                        note(f"No separate clause was given for the obligation, so the termination clause "
+                             f"({ocl}) is cited for both. If the obligation sits in a different clause, "
+                             "say which — citing the termination clause as the source of the obligation "
+                             "misstates the agreement.")
+                lead, subs = C.fit_required_to(case.get("obligation"), case, ocl or blank("clause"))
+                li.append((lead, dict(sub=subs)) if subs else
+                          (lead or f"In terms of Clause {ocl or blank('clause')}, you were required to "
+                           + blank("the obligation")))
+                facts = C.fit_failed_as(case.get("facts"), case)
+                cure = ""
+                if str(case.get("cure_given_date", "")).strip():
+                    cure = (f" This is despite the cure period given on "
+                            f"{fmt_date(case['cure_given_date'])}")
+                    if str(case.get("cure_lapsed_date", "")).strip():
+                        cure += f", which lapsed on {fmt_date(case['cure_lapsed_date'])}"
+                    cure += "."
+                li.append((facts or "You have failed to do so, as " + blank("what happened")) + cure)
+            li.append(TP("termination", "Accordingly, the Company hereby gives notice of termination",
+                         "Accordingly, the Company hereby gives notice of termination of the Agreement "
+                         "under Clause {{CLAUSE_NO}}, with effect from {{EFFECTIVE_DATE}}.",
+                         dict(CLAUSE_NO=cl, EFFECTIVE_DATE=D(case, "effective_date"))))
+            lead = "Upon termination, you are called upon"
+            wd_raw = str(case.get("wind_down") or "")
+            dues_txt = str(case.get("dues") or "").strip()
+            # Don't lead with the dues when the wind-down list already says to pay
+            # them — the old version demanded the same money twice in one sentence.
+            dues_shown = bool(dues_txt) and not re.search(
+                re.escape(re.sub(r"[^\d]", "", dues_txt)[:6]), re.sub(r"[^\d]", "", wd_raw))
+            if dues_txt and dues_shown:
+                lead += f" to clear all outstanding dues of {M(case,'dues')} and"
+            wlead, wsubs = C.fit_called_upon(case.get("wind_down"), case, "wind_down", lead + " to")
+            if wsubs:
+                li.append((wlead, dict(sub=wsubs)))
+            else:
+                li.append(wlead or lead + " to " + blank("wind-down obligations") + ".")
+            li.append(TP("termination", "This termination is without prejudice",
+                         "This termination is without prejudice to the Company's rights and remedies, all "
+                         "of which are expressly reserved, including for recovery of dues and losses."))
+
+        elif kind == "renewal":
+            li.append(f"CEAT Limited (“the Company”) is a Public Limited Company incorporated under the "
+                      f"Companies Act, 1956, having its Registered Office at {ro}, engaged in the "
+                      f"manufacture and sale of Tyres, Tubes and Flaps.")
+            renew = case.get("intent") != "Do not renew"
+            subject = f"Notice of {'Renewal' if renew else 'Non-Renewal'} of {agr} dated {dt}."
+            li.append(TP("renewal", "CEAT Limited (\"the Company\") and you are parties to",
+                         "CEAT Limited (\"the Company\") and you are parties to {{AGREEMENT_NAME}} dated "
+                         "{{AGREEMENT_DATE}} (\"the Agreement\"), which is due to expire on {{EXPIRY_DATE}}.",
+                         dict(AGREEMENT_NAME=agr, AGREEMENT_DATE=dt,
+                              EXPIRY_DATE=D(case, "expiry_date"))).replace(
+                "CEAT Limited (“the Company”) and you", "The Company and you", 1))
+            if renew:
+                term = C.fit_inline(case.get("renewal_term")) or blank("renewal term")
+                has_terms = bool(str(case.get("revised_terms") or "").strip())
+                lead = (f"In terms of Clause {cl}, the Company hereby conveys its intention to renew the "
+                        f"Agreement for a further term of {term}"
+                        + (" on the following revised terms" if has_terms else " on the existing terms"))
+                tlead, tsubs = C.fit_terms(case.get("revised_terms"), case, lead)
+                li.append((tlead, dict(sub=tsubs)) if tsubs else tlead)
+                by = D(case, "confirm_by", "confirm-by date")
+                li.append(f"Kindly confirm your acceptance of the aforesaid terms in writing on or before "
+                          f"{by}. The renewal is offered on the terms stated above and is open for "
+                          f"acceptance until that date; if your written acceptance is not received by then, "
+                          f"the Agreement shall expire on {D(case,'expiry_date')} in accordance with its "
+                          "own terms, without further notice.")
+            else:
+                li.append(TP("renewal", "In terms of Clause {{CLAUSE_NO}}, the Company hereby gives notice "
+                             "that it does NOT",
+                             "In terms of Clause {{CLAUSE_NO}}, the Company hereby gives notice that it does "
+                             "NOT intend to renew the Agreement, which shall accordingly stand expired on "
+                             "{{EXPIRY_DATE}} without further notice.",
+                             dict(CLAUSE_NO=cl, EXPIRY_DATE=D(case, "expiry_date"))))
+                lead = "Upon expiry, you are called upon"
+                wd_raw = str(case.get("wind_down") or "")
+                dues_txt = str(case.get("dues") or "").strip()
+                if dues_txt and not re.search(re.escape(re.sub(r"[^\d]", "", dues_txt)[:6]),
+                                              re.sub(r"[^\d]", "", wd_raw)):
+                    lead += f" to clear outstanding dues of {M(case,'dues')} and"
+                wlead, wsubs = C.fit_called_upon(case.get("wind_down"), case, "wind_down", lead + " to")
+                if wsubs:
+                    li.append((wlead, dict(sub=wsubs)))
+                elif wlead:
+                    li.append(wlead)
+            li.append("This notice is without prejudice to the Company’s rights and remedies, all of "
                       "which are expressly reserved.")
+
+        elif kind == "fm":
+            li.append(f"CEAT Limited (“the Company”) is a Public Limited Company incorporated under the "
+                      f"Companies Act, 1956, having its Registered Office at {ro}, engaged in the "
+                      f"manufacture and sale of Tyres, Tubes and Flaps.")
+            subject = f"Notice invoking Force Majeure under {agr} dated {dt}."
+            li.append(TP("fm", "The Company and you are parties to",
+                         "The Company and you are parties to {{AGREEMENT_NAME}} dated {{AGREEMENT_DATE}} "
+                         "(\"the Agreement\"), which contains a force majeure provision at Clause "
+                         "{{CLAUSE_NO}}.", dict(AGREEMENT_NAME=agr, AGREEMENT_DATE=dt, CLAUSE_NO=cl)))
+            li.append(C.fit_event(case.get("fm_event"), case, D(case, "fm_date", "event date"), cl)
+                      or (f"On {D(case,'fm_date','event date')}, " + blank("the force majeure event")
+                          + f" has occurred, being an event beyond the Company’s reasonable control "
+                            f"within the meaning of Clause {cl}."))
+            aff = C.fit_affected(case.get("affected"), case)
+            imp = C.fit_impact(case.get("impact"), case)
+            qty = [r for r in rows(case, "quantities") if str(r.get("period", "")).strip()]
+            aff_txt = ((aff or "As a direct consequence, the Company is prevented or delayed from "
+                        "performing " + blank("affected obligations") + ".")
+                       + (" " + imp if imp else " The expected impact and duration is "
+                          + blank("impact / duration") + "."))
+            if qty:
+                # The affected deliveries as a table: the same figures in prose are
+                # far easier for the other side to dispute later.
+                tot = {k: sum(to_float(r.get(k)) or 0 for r in qty) for k in ("sched", "done", "pend")}
+                li.append((C.strip_end(aff_txt.split(". ")[0]) + ", in respect of the following "
+                           "quantities:",
+                           dict(head=["Month / period", "Scheduled", "Delivered", "Pending", "Due date"],
+                                rows=[[r.get("period", "—"), r.get("sched") or "—", r.get("done") or "—",
+                                       r.get("pend") or "—", fmt_date(r.get("due")) or r.get("due") or "—"]
+                                      for r in qty]
+                                     + [["Total", f"{tot['sched']:g}", f"{tot['done']:g}",
+                                         f"{tot['pend']:g}", ""]])))
+                rest = ". ".join(aff_txt.split(". ")[1:]).strip()
+                if rest:
+                    li.append(rest)
+            else:
+                li.append(aff_txt)
+            mlead, msubs = C.fit_called_upon(
+                case.get("mitigation"), case, "mitigation",
+                "The Company is taking the following steps to mitigate the effect of the said event")
+            if msubs:
+                li.append((mlead, dict(sub=msubs)))
+            else:
+                li.append(mlead or "The Company is taking the following steps to mitigate the effect of "
+                                   "the said event: " + blank("mitigation steps") + ".")
+            rlead, rsubs = C.fit_relief(case.get("relief"), case, cl)
+            keep = " The Company will keep you informed and resume performance as soon as reasonably " \
+                   "practicable."
+            if rsubs:
+                li.append((rlead, dict(sub=rsubs)))
+                li.append(keep.strip())
+            else:
+                li.append(rlead + keep)
+            li.append("This notice is without prejudice to the Company’s rights and remedies under the "
+                      "Agreement and in law, all of which are expressly reserved.")
+
+        elif kind == "price":
+            subject = f"Notice of Price Revision effective {D(case,'effective_date')}."
+            basis = (f"Clause {case['clause_no']}" if str(case.get("clause_no", "")).strip()
+                     else "the Company’s right to revise prices")
+            li.append(f"CEAT Limited (“the Company”) supplies its Tyres, Tubes and Flaps (“Goods”) to you "
+                      f"under {agr}" + (f" dated {fmt_date(case['agreement_date'])}"
+                                        if str(case.get("agreement_date", "")).strip() else "") + ".")
+            reason = C.fit_inline(C.house_self(str(case.get("reason") or ""))) or blank("reason for the revision")
+            pct = str(case.get("price_change_pct") or "").strip()
+            li.append(f"On account of {reason}, and in terms of {basis}, the Company hereby gives notice of "
+                      f"a revision in the prices of the Goods"
+                      + (f", by {pct}%," if pct and not rows(case, "prices") else "")
+                      + f" with effect from {D(case,'effective_date')}.")
+            prows = [r for r in rows(case, "prices") if str(r.get("sku", "")).strip()]
+            if prows:
+                li.append(("The revised prices are as follows:",
+                           dict(head=["Product / SKU", "Existing price (INR)", "Revised price (INR)",
+                                      "% change"],
+                                rows=[[r.get("sku"), fmt_amount(r.get("old")) or "—",
+                                       fmt_amount(r.get("nw")) or "—",
+                                       _pct(r)] for r in prows])))
+            elif pct:
+                li.append(f"The revision is a uniform {pct}% across the products supplied under the said "
+                          "arrangement; the revised price of each product is its existing price so revised.")
+                note(f"Only an overall percentage ({pct}%) was given, so the notice states the percentage "
+                     "and no size-wise table. A product-wise table is clearer and harder to dispute — add "
+                     "one if you have it.")
+            else:
+                li.append("The revised prices are as follows: " + blank("price table, or the overall % change"))
+            pre = C.fit_inline(C.house_self(str(case.get("pre_orders") or "")))
+            li.append(f"Orders placed and accepted before {D(case,'effective_date')} shall be "
+                      + (pre or blank("treatment of pre-existing orders"))
+                      + f". All orders accepted on or after {D(case,'effective_date')} shall be at the "
+                        "revised prices.")
+            li.append("All other terms and conditions of supply remain unchanged. This notice is without "
+                      "prejudice to the Company’s rights, all of which are expressly reserved.")
 
     # ---------------------------------------------------------- assemble ---
     prior = _prior_para(kind, case, note) if kind in ("s138", "recovery", "breach", "termination") else ""
@@ -957,9 +1127,13 @@ def to_text(kind: str, case: dict) -> str:
                 if isinstance(it, tuple):
                     out.append(f"{i}. {it[0]}")
                     t = it[1]
-                    out.append("   " + " | ".join(t["head"]))
-                    for r in t["rows"]:
-                        out.append("   " + " | ".join(str(c) for c in r))
+                    if t.get("sub"):
+                        for j, sub in enumerate(t["sub"]):
+                            out.append(f"   ({chr(97 + j)}) {sub}")
+                    else:
+                        out.append("   " + " | ".join(t["head"]))
+                        for r in t["rows"]:
+                            out.append("   " + " | ".join(str(c) for c in r))
                 else:
                     out.append(f"{i}. {it}")
                 out.append("")
@@ -975,7 +1149,7 @@ def to_docx(kind: str, case: dict, specimen: bool = False) -> bytes:
     when blanks are left in."""
     import docx
     from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.shared import Pt, RGBColor, Cm
+    from docx.shared import Pt, RGBColor, Cm, Inches
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
 
@@ -1037,7 +1211,14 @@ def to_docx(kind: str, case: dict, specimen: bool = False) -> bytes:
                 p.paragraph_format.space_after = Pt(7)
                 p.paragraph_format.line_spacing = 1.35
                 p.add_run(str(text))
-                if tbl:
+                if tbl and tbl.get("sub"):
+                    for j, sub in enumerate(tbl["sub"]):
+                        sp = doc.add_paragraph()
+                        sp.paragraph_format.left_indent = Inches(0.6)
+                        sp.paragraph_format.space_after = Pt(5)
+                        sp.paragraph_format.line_spacing = 1.35
+                        sp.add_run(f"({chr(97 + j)})\t{sub}")
+                elif tbl:
                     t = doc.add_table(rows=1, cols=len(tbl["head"]))
                     t.style = "Table Grid"
                     for c, h in zip(t.rows[0].cells, tbl["head"]):

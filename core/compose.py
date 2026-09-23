@@ -22,7 +22,7 @@ import hashlib
 import json
 import re
 
-from .words import find_dates, fmt_amount, to_float
+from .words import find_dates, fmt_amount, to_float, to_words
 
 # --------------------------------------------------------------------------
 # small text helpers
@@ -44,6 +44,9 @@ BASE_VERBS = {
     "complete", "raise", "terminate", "initiate", "suspend", "stop", "invoke", "recover",
     "withdraw", "forfeit", "encash", "claim", "seek", "file", "institute", "revoke",
     "appoint", "cancel", "adjust", "debit", "charge", "levy", "block", "hold", "withhold",
+    "register", "record", "upload", "lift", "stock", "service", "handle", "process", "verify",
+    "inspect", "replace", "refund", "reimburse", "deposit", "top", "extend", "confirm", "treat",
+    "grant", "allow", "permit", "restore", "resume", "dispatch", "deliver", "install", "display",
 }
 PARTICIPLE_PASSIVE = {"appointed", "engaged", "supplied", "introduced", "nominated", "granted",
                       "registered", "onboarded", "authorised", "authorized", "empanelled"}
@@ -77,6 +80,47 @@ def money_tidy(t: str) -> str:
         tail = "/-" if "." not in s else ""
         return f"{cur} {s}{tail}"
     return re.sub(r"\b(INR|Rs\.?|₹)\s?(\d{4,}(?:\.\d{1,2})?)(?![\d,/])", rep, t)
+
+
+# A figure right after one of these is money; one right before a unit is not.
+_MONEY_LEAD = (r"(?:from|to|of|at|upto|up to|deposit|deposits|balance|dues|amount|amounts|target|"
+               r"credit|pay|paid|payable|price|sum|value|fee|fees|penalty|charges?|worth|"
+               r"exceeding|minimum|maximum|least|refund|reimburse|security deposit)")
+_UNIT_AFTER = (r"(?:units?|days?|kg|kgs|km|kms|tyres?|tubes?|flaps?|metres?|meters?|mm|%|per\s|pcs|"
+               r"nos\.?|months?|years?|hours?|weeks?|pieces?|sets?|litres?|liters?)")
+
+
+def money_full(t: str, words: bool = True) -> str:
+    """Figures written as money get Indian grouping, 'INR … /-' and, once, the
+    amount in words — the house style the approved notices use. A bare
+    '200000' in a revised-terms answer printed as '200000' before this."""
+    def rupees(v: float) -> str:
+        s_ = f"INR {fmt_amount(v)}" + ("/-" if float(v).is_integer() else "")
+        return s_ + (f" ({to_words(v)})" if words else "")
+
+    def bare(m):
+        lead, num = m.group(1), m.group(2)
+        v = to_float(num)
+        if v is None or v < 1000:
+            return m.group(0)
+        return f"{lead} {rupees(v)}"
+
+    out = re.sub(r"\b(" + _MONEY_LEAD + r")\s+(?:INR\s*|Rs\.?\s*|\u20b9\s*)?"
+                 r"(\d{4,}(?:\.\d{1,2})?|\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?)"
+                 r"(?!\s*" + _UNIT_AFTER + r")(?![\d.,/])(?!\s*\(Rupees)",
+                 bare, t, flags=re.I)
+    # already-prefixed amounts: grouping, "/-" and words if not already there
+    def prefixed(m):
+        v = to_float(m.group(2))
+        return m.group(0) if v is None or v < 1000 else rupees(v)
+    out = re.sub(r"(?<!\w)(INR|Rs\.?|\u20b9)\s*(\d[\d,]*(?:\.\d{1,2})?)(?:/-)?"
+                 r"(?!\s*\(Rupees)(?![\d.,/])", prefixed, out, flags=re.I)
+    return out
+
+
+def contract_text(t: str) -> str:
+    """House treatment for the free text in the contract notices."""
+    return money_full(house_self(t))
 
 
 def clean(raw) -> str:
@@ -595,3 +639,186 @@ def ai_review(kind: str, text: str, case: dict, chat=None) -> list[tuple[str, st
         if prob:
             out.append((sev, "AI read-through" + (f" ({where})" if where else "") + f": {prob}"))
     return out
+
+# --------------------------------------------------------------------------
+# the contract notices (termination, renewal, force majeure, price)
+#
+# These four types were left on the old "paste the answer into the middle of
+# the sentence" path, which produced "you were required to to register…",
+# "The expected impact/duration is due to the flooding…" and "and to suspension
+# of CEAT's delivery obligations…". Each slot now has a fitter that works out
+# the shape of the answer and picks wording that reads correctly with it, and a
+# multi-item answer becomes a lettered list instead of a wall of prose.
+# --------------------------------------------------------------------------
+BULLET = re.compile(r"^\s*(?:[-•*·–]|\(?[a-z]\)|\(?\d{1,2}[.)])\s+", re.I)
+
+
+SELF_VERB = (r"(?=\s+(?:will|shall|is|was|are|were|has|have|had|proposes|intends|may|can|does|"
+             r"did|would|could|remains|continues|expects))")
+
+
+def house_self(t: str) -> str:
+    """The notice calls itself "the Company". An answer that says "CEAT will…"
+    or "CEAT's obligation" made the notice speak of itself in the third person
+    in the middle of its own sentences."""
+    t = re.sub(r"(?<![“\"'])\bCEAT Limited\b(?![”\"'])", "the Company", t)
+    t = re.sub(r"(?<![“\"'])\bCEAT['’]s\b", "the Company's", t)
+    t = re.sub(r"(?<![“\"'])\bCEAT\b" + SELF_VERB, "the Company", t)
+    return t
+
+
+def as_items(raw) -> list[str]:
+    """A multi-item answer -> its items. Lines and bullets first, then
+    semicolons, then sentences."""
+    t = clean(raw)
+    if not t:
+        return []
+    lines = [l for l in t.split("\n") if l.strip()]
+    if len(lines) > 1:
+        items = [BULLET.sub("", l) for l in lines]
+    elif t.count(";") >= 1:
+        items = t.split(";")
+    else:
+        items = re.split(r"(?<=[.])\s+(?=[A-Z])", t)
+    out = [strip_end(i.strip()) for i in items]
+    return [i for i in out if i]
+
+
+def punctuate(items: list[str]) -> list[str]:
+    """Legal list punctuation: semicolons, 'and' before the last, full stop."""
+    if not items:
+        return []
+    out = []
+    for i, it in enumerate(items):
+        last = i == len(items) - 1
+        end = "." if last else ("; and" if i == len(items) - 2 else ";")
+        out.append(strip_end(it) + end)
+    return out
+
+
+def _sub_or_inline(lead: str, items: list[str], joiner: str = " ") -> tuple[str, list[str]]:
+    """One item reads inline; several become a lettered list under the lead."""
+    if len(items) == 1:
+        return strip_end(lead) + joiner + end_stop(items[0]), []
+    return strip_end(lead) + ":", punctuate(items)
+
+
+def fit_required_to(raw, case, clause_txt: str) -> tuple[str, list[str]]:
+    """Termination: 'In terms of Clause X, you were required to ___.'"""
+    f = fitted(case, "obligation", raw)
+    t = strip_end(clean(raw)) if not f else strip_end(f["text"])
+    if not t:
+        return "", []
+    was_to = bool(re.match(r"^to\s+", t, re.I))       # "to register …" is a verb phrase
+    items = [re.sub(r"^to\s+", "", i, flags=re.I) for i in as_items(contract_text(t))]
+    mode = "verb" if was_to else ((f or {}).get("mode") or shape(items[0] if len(items) == 1 else t))
+    lead = f"In terms of Clause {clause_txt}, you were required to"
+    if mode in ("verb", "inline") or len(items) > 1:
+        return _sub_or_inline(lead, [lower_first(i) for i in items])
+    if mode == "noun":
+        return _sub_or_inline(f"In terms of Clause {clause_txt}, your obligations included",
+                              [lower_first(i) for i in items])
+    return (f"In terms of Clause {clause_txt}, your obligations were as follows: "
+            + end_stop(cap_first(t))), []
+
+
+def fit_failed_as(raw, case) -> str:
+    """Termination: 'You have failed to do so, as ___.'"""
+    f = fitted(case, "facts", raw)
+    t = contract_text(strip_end(clean(raw)) if not f else strip_end(f["text"]))
+    if not t:
+        return ""
+    mode = (f or {}).get("mode") or shape(t)
+    if mode in ("clause", "inline"):
+        return f"You have failed to do so, as {lower_first(t)}."
+    if mode == "failure":
+        return f"You have failed to do so, in that you have {lower_first(t)}."
+    if mode == "noun":
+        return f"You have failed to do so, as {lower_first(t)}."
+    return "You have failed to do so. " + end_stop(cap_first(t))
+
+
+def fit_event(raw, case, date_txt: str, clause_txt: str) -> str:
+    """Force majeure: 'On/from DATE, ___ has occurred, being an event beyond …'"""
+    f = fitted(case, "fm_event", raw)
+    t = contract_text(strip_end(clean(raw)) if not f else strip_end(f["text"]))
+    if not t:
+        return ""
+    parts = re.split(r"(?<=[.])\s+(?=[A-Z])", t)
+    head, rest = strip_end(parts[0]), " ".join(parts[1:]).strip()
+    lead = (f"On {date_txt}, {lower_first(head)} has occurred, being an event beyond the "
+            f"Company's reasonable control within the meaning of Clause {clause_txt}.")
+    if shape(head) in ("clause", "conditional") or first_word(head) in ("there", "it"):
+        lead = (f"On {date_txt}, {lower_first(head)}. That event is beyond the Company's "
+                f"reasonable control within the meaning of Clause {clause_txt}.")
+    return (lead + (" " + end_stop(cap_first(rest)) if rest else "")).strip()
+
+
+def fit_affected(raw, case, clause_ref: str = "") -> str:
+    """Force majeure: 'the Company is prevented/delayed from performing ___.'"""
+    f = fitted(case, "affected", raw)
+    t = contract_text(strip_end(clean(raw)) if not f else strip_end(f["text"]))
+    if not t:
+        return ""
+    lead = "As a direct consequence, the Company is prevented or delayed from performing"
+    t = re.sub(r"^the Company's\b", "its", t)      # not "performing the Company's obligation"
+    if multi_sentence(t):          # only genuinely separate sentences stand alone
+        return (f"{lead} its obligations under the Agreement" + (f" at Clause {clause_ref}" if clause_ref else "")
+                + ". " + end_stop(cap_first(t)))
+    return f"{lead} {lower_first(t)}."
+
+
+def fit_impact(raw, case) -> str:
+    """Force majeure: 'The expected impact/duration is ___.'"""
+    f = fitted(case, "impact", raw)
+    t = contract_text(strip_end(clean(raw)) if not f else strip_end(f["text"]))
+    if not t:
+        return ""
+    if multi_sentence(t):
+        return end_stop(cap_first(t))
+    # "production will remain suspended until…" is a clause, not a noun phrase:
+    # it needs "is that", or the sentence reads "the duration is production will…"
+    if re.search(r"^[\w\s,'’\-()]{0,80}?\b(?:will|shall|is|are|was|were|has|have|remains?|expects?)\b",
+                 t, re.I):
+        return f"The expected impact and duration is that {lower_first(t)}."
+    return f"The expected impact and duration is {lower_first(t)}."
+
+
+def fit_relief(raw, case, clause_txt: str) -> tuple[str, list[str]]:
+    """Force majeure: '… calls upon you to treat the affected obligations as
+    suspended …, and to ___.'"""
+    f = fitted(case, "relief", raw)
+    t = contract_text(strip_end(clean(raw)) if not f else strip_end(f["text"]))
+    lead = (f"Accordingly, in terms of Clause {clause_txt}, the Company hereby invokes force majeure "
+            "and calls upon you to treat the affected obligations as suspended for the duration of "
+            "the event")
+    if not t:
+        return lead + ".", []
+    items = as_items(t)
+    if all(shape(i) in ("verb", "inline") for i in items) and len(items) <= 2:
+        return strip_end(lead) + ", and to " + ", and to ".join(lower_first(i) for i in items) + ".", []
+    return (strip_end(lead) + ", and to confirm the following:",
+            punctuate([lower_first(i) for i in items]))
+
+
+def fit_called_upon(raw, case, slot: str, lead: str) -> tuple[str, list[str]]:
+    """'Upon termination/expiry, you are called upon to ___.' — wind-down items."""
+    f = fitted(case, slot, raw)
+    t = contract_text(strip_end(clean(raw)) if not f else strip_end(f["text"]))
+    if not t:
+        return "", []
+    items = [lower_first(re.sub(r"^to\s+", "", i, flags=re.I)) for i in as_items(t)]
+    return _sub_or_inline(lead, items)
+
+
+def fit_terms(raw, case, lead: str) -> tuple[str, list[str]]:
+    """Renewal: the revised terms, one per item."""
+    f = fitted(case, "revised_terms", raw)
+    t = contract_text(strip_end(clean(raw)) if not f else strip_end(f["text"]))
+    if not t:
+        return strip_end(lead) + ".", []
+    items = as_items(t)
+    if len(items) == 1:
+        return strip_end(lead) + ": " + end_stop(lower_first(items[0])), []
+    return strip_end(lead) + ":", punctuate([cap_first(i) for i in items])
+

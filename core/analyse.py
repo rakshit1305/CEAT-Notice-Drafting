@@ -56,6 +56,20 @@ def _prompt(kind: str, case: dict, docs: list[Doc]) -> str:
 
     cols = {t: [c[0] for c in TABLE_COLS[t]] for t in TABLE_COLS}
 
+    # Everything typed into a question box. These were previously held back from
+    # the model entirely, so a price table typed by hand was invisible to it —
+    # and the model quite correctly reported that no price table had been given.
+    from .schema import questions as _questions
+    qtitle = {q.id: q.ask for q in _questions(kind)}
+    typed_blocks = []
+    if str(case.get("_narrative") or "").strip():
+        typed_blocks.append(f"--- what they told us in their own words ---\n{case['_narrative']}")
+    for k, v in case.items():
+        if str(k).startswith("_raw_") and str(v or "").strip():
+            qid = str(k)[len("_raw_"):]
+            typed_blocks.append(f"--- answer to: {qtitle.get(qid, qid)} ---\n{v}")
+    typed_answers = "\n\n".join(typed_blocks) or "(nothing typed into the answer boxes)"
+
     return f"""You are the analysis step of CEAT Limited's legal notice drafting console.
 You are preparing a {SK.notice_ref(kind).kind} — {ref.when_to_use or kind}.
 
@@ -68,6 +82,10 @@ THE INPUTS THIS NOTICE TYPE NEEDS (from its approved reference file):
 WHAT THE USER HAS ALREADY TOLD US — treat as authoritative, never contradict it,
 never restate it back as if newly found:
 {json.dumps(known, indent=2, default=str, ensure_ascii=False)}
+
+WHAT THE USER TYPED INTO THE ANSWER BOXES (their own words, authoritative — a table
+typed here is as good as an attached file; read it and return it in the proper fields):
+{typed_answers}
 
 THE ATTACHED DOCUMENTS:
 {documents}
@@ -118,6 +136,11 @@ WHAT THE FIELDS MEAN (use a key only for exactly this meaning):
 RULES FOR THIS NOTICE TYPE:
 {_KIND_RULES.get(kind, "- (none beyond the above)")}
 
+ALWAYS:
+- For a company or a partnership, noticee_name is the FIRM ITSELF (e.g. "M/s Om Sai Tyres &
+  Services"). The individuals go in the directors array with their own names. Never put a
+  person's name in noticee_name for a company or partnership, and never drop the firm name.
+
 Valid scalar field keys: {", ".join(SCALAR_KEYS)}
 Valid table field keys, each an array of objects with exactly these columns:
 {json.dumps(cols, indent=1)}
@@ -144,6 +167,20 @@ _KIND_RULES = {
         "- For a sole proprietorship, noticee_name is the proprietor's personal name and firm_name "
         "is the firm. If the proprietor's name is not given, leave noticee_name out and say so in "
         "\"missing\" — do not copy the firm name into it."),
+    "termination": (
+        "- clause_no is the clause that PERMITS TERMINATION. obligation_clause is the clause that "
+        "imposed the obligation broken. They are usually different — never copy one into the other.\n"
+        "- facts are what the other party did or failed to do. Internal approvals, who authorised the "
+        "termination and what CEAT intends to do next are NOT facts of the breach: leave them out."),
+    "fm": (
+        "- fm_event is the event itself. affected is what the Company cannot perform. impact is how "
+        "long it will last. Keep them in their own fields.\n"
+        "- attn_name is a contact person at the other party; never put a person in noticee_name when "
+        "the counterparty is a company."),
+    "price": (
+        "- prices is the SKU-wise table (sku, old, nw, pct). If only one overall percentage is given, "
+        "put it in price_change_pct and leave prices empty.\n"
+        "- A price table typed into an answer box counts exactly as much as one in a file: read it."),
     "recovery": (
         "- The amount is the outstanding balance; it must equal the sum of the statement-of-account "
         "rows you return."),
@@ -836,8 +873,40 @@ def analyse(kind: str, case: dict, docs: list[Doc]) -> Found:
                 merged.evidence[k] = got.evidence[k]
         merged.missing += [m for m in got.missing if m not in merged.missing]
         merged.notes += [n for n in got.notes if n not in merged.notes]
-    return _s138_amount(kind, case, _fix_noticees(case, with_typed(
-        _prefer_filtered_rows(base, merged, case, docs, kind))))
+    return _s138_amount(kind, case, _firm_first(case, _fix_noticees(case, with_typed(
+        _prefer_filtered_rows(base, merged, case, docs, kind)))))
+
+
+_PERSONISH = re.compile(r"^\s*(?:mr|mrs|ms|shri|smt|dr|sri)\b\.?\s", re.I)
+_FIRMISH = re.compile(r"\b(?:pvt|private|ltd|limited|llp|& co|and co|company|firm|enterprises?|"
+                      r"traders?|agenc(?:y|ies)|tyres?|services?|industries|corporation)\b|^m/?s\b", re.I)
+
+
+def _firm_first(case: dict, found: Found) -> Found:
+    """A company or partnership is itself Noticee No. 1. The model sometimes put
+    the partners' names there and dropped the firm — which is how a renewal
+    notice went out addressed to "Harish Patel and Nilesh Patel" with the firm,
+    the actual party to the agreement, nowhere in it."""
+    v = found.values
+    typ = str(v.get("noticee_type") or case.get("noticee_type") or "")
+    if not typ.startswith(("Company", "Partnership")):
+        return found
+    name = str(v.get("noticee_name") or case.get("noticee_name") or "").strip()
+    firm = str(v.get("firm_name") or case.get("firm_name") or "").strip()
+    if not name:
+        return found
+    looks_person = bool(_PERSONISH.match(name)) or (" and " in name.lower() and not _FIRMISH.search(name))
+    if looks_person and firm:
+        v["noticee_name"] = firm
+        v["firm_name"] = ""
+        found.notes.append(f"“{name}” was read as the noticee, but the counterparty is a "
+                           f"{typ.split()[0].lower()}: “{firm}” has been put back as Noticee No. 1 and "
+                           "the individuals listed as its partners/directors.")
+    elif looks_person:
+        found.notes.append(f"“{name}” looks like a person, but the counterparty type is "
+                           f"{typ.split()[0].lower()}. The firm itself must be Noticee No. 1 — check "
+                           "the name.")
+    return found
 
 
 def _s138_amount(kind: str, case: dict, found: Found) -> Found:

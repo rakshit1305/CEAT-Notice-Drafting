@@ -13,7 +13,7 @@ question so it can be corrected.
 from __future__ import annotations
 import re
 
-from .words import find_amounts, find_dates, iso, parse_date
+from .words import find_amounts, find_dates, iso, parse_date, to_float
 
 # ---------------------------------------------------------------- helpers --
 ADDR_START = re.compile(
@@ -123,9 +123,20 @@ def _name_and_address(raw: str) -> tuple[str, str, str]:
     return name, firm, ", ".join(tail)
 
 
+NUM_COLS = ("amt", "old", "nw", "sched", "done", "pend", "qty")   # figure columns, in order
+PCT_RX = re.compile(r"^[+\-]?\d{1,3}(?:\.\d{1,2})?\s*%$")
+
+
 def _rows_from_lines(raw: str, cols: list[str]) -> list[dict]:
-    """'INV-1 | 02.05.2026 | 150000' one per line -> table rows."""
+    """'INV-1 | 02.05.2026 | 150000' one per line -> table rows.
+
+    Figures fill the table's own numeric columns in the order they appear. The
+    old version only ever filled a column literally named "amt", so a price
+    table (sku | old | nw | pct) lost every figure it was given and came back
+    empty — which is why the price notice could not be drafted at all.
+    """
     out = []
+    nums_wanted = [c for c in NUM_COLS if c in cols]
     for line in _lines(raw):
         # A comma followed by 2–3 digits is inside an Indian-format amount
         # ("3,10,000"), not a column break — splitting there once turned a
@@ -134,20 +145,33 @@ def _rows_from_lines(raw: str, cols: list[str]) -> list[dict]:
         if len(parts) < 2:
             continue
         row = {c: "" for c in cols}
+        text_cols = [c for c in cols if c in ("ref", "no", "sku", "desc", "size", "bank", "period")]
+        date_cols = [c for c in cols if c in ("date", "due")]
         for p in parts:
-            d, a = parse_date(p), find_amounts("INR " + p)
-            if d and "date" in row and not row["date"]:
-                row["date"] = d.isoformat()
-            elif re.fullmatch(r"[\d,]+(?:\.\d{1,2})?", p) and "amt" in row and not row["amt"]:
-                row["amt"] = re.sub(r"[^\d.]", "", p)
-            else:
-                for c in cols:
-                    if c in ("ref", "no", "sku") and not row[c]:
-                        row[c] = p
-                        break
+            d = parse_date(p)
+            clean = re.sub(r"^(?:INR|Rs\.?|\u20b9)\s*", "", p, flags=re.I).strip().rstrip("/-").strip()
+            if d and date_cols:
+                slot = next((c for c in date_cols if not row[c]), "")
+                if slot:
+                    row[slot] = d.isoformat()
+                    continue
+            if PCT_RX.match(p) and "pct" in row and not row["pct"]:
+                row["pct"] = p.replace(" ", "")
+                continue
+            if re.fullmatch(r"[\d,]+(?:\.\d{1,2})?", clean):
+                nxt = next((c for c in nums_wanted if not row[c]), "")
+                if nxt:
+                    row[nxt] = re.sub(r"[^\d.]", "", clean)
+                    continue
+            for c in text_cols:
+                if not row[c]:
+                    row[c] = p
+                    break
         if any(row.values()):
             out.append(row)
-    return out if len(out) >= 1 and any(r.get("amt") or r.get("date") for r in out) else []
+    keep = [r for r in out if any(r.get(c) for c in nums_wanted)
+            or any(r.get(c) for c in ("date", "due") if c in cols)]
+    return keep
 
 
 # ------------------------------------------------------------------ rules --
@@ -159,6 +183,14 @@ def _parse(kind: str, qid: str, raw: str, case: dict) -> dict:
     low = t.lower()
 
     if qid == "addr":
+        # "Kind Attn.: Mr Rahul Sawant, Director – Operations" is a contact line,
+        # not part of the address and not a second noticee.
+        am = re.search(r"(?:kind\s+)?att(?:n|ention)\.?\s*[:\-]\s*([^\n,]+)(?:,\s*([^\n]+))?", t, re.I)
+        if am:
+            v["attn_name"] = am.group(1).strip(" .")
+            if am.group(2):
+                v["attn_desig"] = am.group(2).strip(" .")
+            t = t[:am.start()] + t[am.end():]
         name, firm, addr = _name_and_address(t)
         # A company or partnership is itself the noticee (Noticee No. 1); its
         # directors/partners are read separately. Only a proprietorship splits
@@ -378,11 +410,49 @@ def _parse(kind: str, qid: str, raw: str, case: dict) -> dict:
     elif qid == "detail" and kind == "termination":
         v.update(_dates_by_cue(t, {"cure_given_date": r"cure (?:notice|period) (?:given|issued|sent)|cure notice",
                                    "cure_lapsed_date": r"laps|expir|end(?:ed)?"}))
+        # the clause that imposed the obligation, stated here rather than the
+        # termination clause asked for in the previous question
+        m = re.search(r"\bunder\s+Clauses?\s+([\d.]+(?:\([a-z0-9]+\))?)", t, re.I) or \
+            re.search(r"\bClauses?\s+([\d.]+(?:\([a-z0-9]+\))?)", t, re.I)
+        if m:
+            v["obligation_clause"] = m.group(1).rstrip(".")
+
+    elif qid == "qty":
+        rows_ = _rows_from_lines(t, ["period", "sched", "done", "pend", "due"])
+        out_rows = []
+        for r in rows_:
+            if not str(r.get("period", "")).strip():
+                continue
+            if not r.get("pend") and r.get("sched"):
+                sc, dn = to_float(r["sched"]) or 0, to_float(r.get("done")) or 0
+                r["pend"] = f"{sc - dn:g}"
+            out_rows.append(r)
+        if out_rows:
+            v["quantities"] = out_rows
 
     elif qid == "prices":
-        rows = _rows_from_lines(t, ["sku", "old", "nw"])
-        if rows:
-            v["prices"] = rows
+        # "desc" catches a tyre-size column so it is kept with the SKU instead
+        # of being dropped; "pct" was missing altogether, so the % change was lost.
+        rows = _rows_from_lines(t, ["sku", "desc", "old", "nw", "pct"])
+        out_rows = []
+        for r in rows:
+            sku = " ".join(x for x in (r.get("sku"), r.get("desc")) if x).strip()
+            if not (sku or r.get("old") or r.get("nw")):
+                continue
+            row = dict(sku=sku, old=r.get("old", ""), nw=r.get("nw", ""), pct=r.get("pct", ""))
+            if not row["pct"] and row["old"] and row["nw"]:
+                o, n = to_float(row["old"]), to_float(row["nw"])
+                if o:
+                    row["pct"] = f"{(n - o) / o * 100:+.1f}%"
+            out_rows.append(row)
+        if out_rows:
+            v["prices"] = out_rows
+        # an overall percentage, when no size-wise table is given
+        m = re.search(r"(?:increase|decrease|revision|revised|up|down|change)[^.\n%]{0,40}?"
+                      r"([+\-]?\d{1,3}(?:\.\d{1,2})?)\s*%", t, re.I) or \
+            re.search(r"([+\-]?\d{1,3}(?:\.\d{1,2})?)\s*%\s*(?:increase|decrease|revision|across)", t, re.I)
+        if m:
+            v["price_change_pct"] = m.group(1).lstrip("+")
 
     return {k: x for k, x in v.items() if x not in ("", None, [], {})}
 
