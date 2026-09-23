@@ -700,6 +700,25 @@ with left:
         with st.container(border=True, key=f"glass_q_{KIND}_{r['q'].id}"):
             ask(r)
 
+    ls = st.session_state.get("_last_saved")
+    if ls and ls[0] == KIND:
+        c1, c2 = st.columns([3, 1])
+        c1.info(f"These answers are the ones used for the notice saved for **{ls[1] or 'this matter'}**. "
+                "Starting a different matter? Clear the case first — otherwise details such as the "
+                "signatory or the notice date carry over.", icon="↩️")
+        if c2.button("Clear and start new", key=f"clr2_{KIND}", use_container_width=True):
+            st.session_state.case[KIND] = default_case(KIND)
+            st.session_state.docs[KIND] = {}
+            st.session_state.drafted[KIND] = False
+            st.session_state.report.pop(KIND, None)
+            st.session_state.pop("_last_saved", None)
+            for k in [k for k in list(st.session_state.keys()) if str(k).startswith((f"w_{KIND}_", f"spec_{KIND}"))]:
+                del st.session_state[k]
+            for t in TABLE_COLS:
+                tk = f"{KIND}:{t}"
+                st.session_state.tver[tk] = st.session_state.tver.get(tk, 0) + 1
+            st.rerun()
+
     st.caption("Nothing here is compulsory to start. Answer what you know, attach what you have — "
                "anything still open shows as [● …] in the preview, and must be filled before the "
                "notice can be downloaded as ready to issue.")
@@ -738,12 +757,23 @@ paint_hero(ROWS, ANSWERED, PCT, CRIT_OPEN)
 if go:
     with st.spinner("Reading the documents and checking the matter…"):
         found = analyse(KIND, CASE, list(DOCS.values()))
-        applied, evidence = [], {}
+        applied, evidence, clashes = [], {}, []
         for k, v in (found.values or {}).items():
             if k not in LABELS and k not in TABLE_COLS:
                 continue
             soft = k in (CASE.get("_defaults") or [])
             if is_filled(CASE, k) and not soft:   # never overwrite the user
+                # What the console already holds wins — but if the documents say
+                # something different, say so. A value left over from an earlier
+                # matter in this session is indistinguishable from one typed just
+                # now, and that is how a notice can go out with the wrong
+                # signatory or date.
+                if k in ("signatory_name", "signatory_desig", "notice_date", "reply_date", "mode",
+                         "noticee_name", "effective_date", "amount", "agreement_date", "clause_no"):
+                    held, got = str(CASE.get(k) or "").strip(), str(v).strip()
+                    if held and got and held.lower() != got.lower() and len(got) < 120:
+                        clashes.append(f"{label(k)}: the console holds “{held}”, the documents say "
+                                       f"“{got}”. The value you entered was kept.")
                 continue
             if v in (None, "", [], {}):
                 continue
@@ -762,6 +792,8 @@ if go:
         if llm_ready() and not found.model_failed:
             notes += COMPOSE.llm_fit_case(KIND, CASE)
         rep = validate(KIND, CASE, list(DOCS.values()))
+        for c in clashes:
+            rep.flags.insert(0, ("crit", "Check this: " + c))
         if found.model_failed:
             rep.flags.insert(0, ("crit", "The AI model was NOT used — the call failed "
                                          f"({found.error[:140]}). Everything was read by the built-in "
@@ -882,6 +914,7 @@ with right:
                                "text/plain", use_container_width=True, key=f"dlt_{KIND}", disabled=locked)
             saved = (R or {}).get("saved")
             if saved:
+                st.session_state["_last_saved"] = (KIND, saved.get("party", ""), saved.get("file", ""))
                 st.caption(f"💾 Saved in **Saved notices** — `{saved['folder']}/{saved['file']}.docx`"
                            + (" (this exact notice was already saved earlier)" if saved.get("duplicate") else ""))
             else:
