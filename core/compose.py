@@ -109,8 +109,8 @@ def money_full(t: str, words: bool = True) -> str:
         return f"{lead} {rupees(v)}"
 
     out = re.sub(r"\b(" + _MONEY_LEAD + r")\s+(INR\s*|Rs\.?\s*|\u20b9\s*)?"
-                 r"(\d{4,}(?:\.\d{1,2})?|\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?)"
-                 r"(?!\s*" + _UNIT_AFTER + r")(?!\d)(?![.,/]\d)(?!\s*\(Rupees)",
+                 r"(\d{4,}(?:\.\d{1,2})?|\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?)(?:/-)?"
+                 r"(?!\s*" + _UNIT_AFTER + r")(?!\d)(?![.,/]\d)(?!/)(?!\s*\(Rupees)",
                  bare, t, flags=re.I)
     # already-prefixed amounts: grouping, "/-" and words if not already there
     def prefixed(m):
@@ -123,7 +123,7 @@ def money_full(t: str, words: bool = True) -> str:
 
 def contract_text(t: str) -> str:
     """House treatment for the free text in the contract notices."""
-    return money_full(house_self(t))
+    return money_full(house_self(house_you(t)[0]))
 
 
 def clean(raw) -> str:
@@ -684,7 +684,13 @@ def as_items(raw) -> list[str]:
     else:
         items = re.split(r"(?<=[.])\s+(?=[A-Z])", t)
     out = [strip_end(i.strip()) for i in items]
-    return [i for i in out if i]
+    out = [i for i in out if i]
+    if len(out) == 1:
+        # one long line: "payment of …, removal of …, and return of …"
+        commas = comma_items(out[0])
+        if commas:
+            return [strip_end(c) for c in commas]
+    return out
 
 
 def punctuate(items: list[str], last: str = ".") -> list[str]:
@@ -806,13 +812,22 @@ def fit_relief(raw, case, clause_txt: str) -> tuple[str, list[str]]:
             punctuate([lower_first(i) for i in items]))
 
 
-def fit_called_upon(raw, case, slot: str, lead: str) -> tuple[str, list[str]]:
-    """'Upon termination/expiry, you are called upon to ___.' — wind-down items."""
+def fit_called_upon(raw, case, slot: str, lead: str, lead_noun: str = "") -> tuple[str, list[str]]:
+    """'Upon termination/expiry, you are called upon to ___.' — wind-down items.
+
+    Items written as noun phrases ("removal of all signage") cannot follow
+    "called upon to" — that produced "you are called upon to appropriation of
+    the security deposit". A noun-phrase list gets a lead that fits it."""
     f = fitted(case, slot, raw)
     t = contract_text(strip_end(clean(raw)) if not f else strip_end(f["text"]))
     if not t:
         return "", []
     items = [lower_first(re.sub(r"^to\s+", "", i, flags=re.I)) for i in as_items(t)]
+    nouny = sum(1 for i in items if _LISTY.match(i) and not re.match(
+        r"(?:pay|remove|return|cease|refund|deliver|hand|submit|settle|transfer|stop|deposit)\b",
+        i, re.I))
+    if lead_noun and items and nouny >= max(1, int(0.6 * len(items))):
+        return _sub_or_inline(lead_noun, [cap_first(i) for i in items])
     return _sub_or_inline(lead, items)
 
 
@@ -890,4 +905,100 @@ def money_table(items: list[str]) -> dict | None:
         return None
     rows.append(["Total", "", fmt_amount(total)])
     return dict(head=["Invoice / reference", "Date", "Amount (INR)"], rows=rows)
+
+# --------------------------------------------------------------------------
+# long prose -> paragraphs and points
+#
+# People paste a whole briefing note into one answer box. Before this, that
+# printed as a single 430-word paragraph with twelve sentences in it, and a
+# comma-separated list of wind-down obligations printed as one 146-word
+# sentence. A notice puts one point in one paragraph.
+# --------------------------------------------------------------------------
+_LISTY = re.compile(r"^(?:payment|removal|return|revocation|cessation|delivery|refund|supply|"
+                    r"appropriation|recovery|demand|surrender|handover|hand-over|deposit|"
+                    r"submission|settlement|transfer|discontinuance|\w+(?:tion|sion|ment|ance|ence|"
+                    r"ure|ing))\b", re.I)
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z(\u201c])")
+# "Report No. TS/WCA/..." and "Mr. Reddy" are not sentence ends
+_ABBREV = re.compile(r"\b(?:No|Nos|Mr|Mrs|Ms|Dr|Shri|Smt|Ltd|Pvt|Co|Corp|Inc|Rs|INR|Sr|Jr|vs|viz|"
+                     r"etc|i\.e|e\.g|Cl|Sec|Art|Ref|Dt|Regn|Reg|St|Rd)\.$", re.I)
+
+
+def sentences(t: str) -> list[str]:
+    out = []
+    for piece in _SENT_SPLIT.split(str(t or "").strip()):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if out and _ABBREV.search(out[-1]):
+            out[-1] += " " + piece          # the split was after an abbreviation
+        else:
+            out.append(piece)
+    return out
+
+
+def comma_items(t: str) -> list[str]:
+    """A run of obligations separated by commas — "payment of …, removal of …,
+    cessation of …, and return of …" — as separate items. Commas inside
+    amounts (2,24,400) never split."""
+    raw_parts = [p.strip() for p in re.split(r";\s*|,\s*(?!\d{2,3}\b)", t) if p.strip()]
+    raw_parts = [re.sub(r"^and\s+", "", p, flags=re.I) for p in raw_parts]
+    if len(raw_parts) < 3:
+        return []
+    # Only a fragment that starts like a new obligation opens a new item;
+    # anything else belongs to the one before it ("removal of all signage,
+    # fascia and display material" is one obligation, not two).
+    parts = []
+    for p in raw_parts:
+        if parts and not (_LISTY.match(p) and len(p) > 12):
+            parts[-1] += ", " + p
+        else:
+            parts.append(p)
+    if len(parts) < 3:
+        return []
+    listy = sum(1 for p in parts if _LISTY.match(p) and len(p) > 12)
+    if listy < max(3, int(0.6 * len(parts))):
+        return []
+    return parts
+
+
+def split_paragraph(text: str, max_words: int = 110) -> list[str]:
+    """One long block -> several paragraphs, broken at sentence ends. Anything
+    shorter than `max_words` is left exactly as it is."""
+    t = str(text or "").strip()
+    if len(t.split()) <= max_words:
+        return [t]
+    out, cur = [], []
+    for sent in sentences(t):
+        cur.append(sent)
+        if len(" ".join(cur).split()) >= max_words * 0.55:
+            out.append(" ".join(cur))
+            cur = []
+    if cur:
+        if out and len(" ".join(cur).split()) < 12:      # a stray tail rejoins
+            out[-1] += " " + " ".join(cur)
+        else:
+            out.append(" ".join(cur))
+    return out or [t]
+
+
+_THIRD = re.compile(r"\bthe\s+(Dealer|Distributor|Noticee|Dealership concern)\b(?!\s+Code)", re.I)
+_THIRD_POSS = re.compile(r"\bthe\s+(Dealer|Distributor|Noticee)['\u2019]s\b", re.I)
+
+
+def house_you(t: str) -> tuple[str, bool]:
+    """The notice addresses the other side as "you". An answer copied from an
+    internal note says "the Dealer was required…", which reads as if the notice
+    were about somebody else."""
+    out = _THIRD_POSS.sub("your", t)
+    out = _THIRD.sub("you", out)
+    if out == t:
+        return t, False
+    # verb agreement after the swap
+    for a, b in ((r"\byou was\b", "you were"), (r"\byou has\b", "you have"),
+                 (r"\byou is\b", "you are"), (r"\byou does\b", "you do"),
+                 (r"\byou wasn't\b", "you weren't"), (r"\bYou was\b", "You were"),
+                 (r"\bYou has\b", "You have"), (r"\bYou is\b", "You are")):
+        out = re.sub(a, b, out)
+    return out, True
 

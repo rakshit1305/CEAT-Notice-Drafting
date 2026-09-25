@@ -936,7 +936,8 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                 re.escape(re.sub(r"[^\d]", "", dues_txt)[:6]), re.sub(r"[^\d]", "", wd_raw))
             if dues_txt and dues_shown:
                 lead += f" to clear all outstanding dues of {M(case,'dues')} and"
-            wlead, wsubs = C.fit_called_upon(case.get("wind_down"), case, "wind_down", lead + " to")
+            wlead, wsubs = C.fit_called_upon(case.get("wind_down"), case, "wind_down", lead + " to",
+                                             lead_noun="Upon termination, the following shall apply")
             if wsubs:
                 li.append((wlead, dict(sub=wsubs)))
             else:
@@ -984,7 +985,8 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                 if dues_txt and not re.search(re.escape(re.sub(r"[^\d]", "", dues_txt)[:6]),
                                               re.sub(r"[^\d]", "", wd_raw)):
                     lead += f" to clear outstanding dues of {M(case,'dues')} and"
-                wlead, wsubs = C.fit_called_upon(case.get("wind_down"), case, "wind_down", lead + " to")
+                wlead, wsubs = C.fit_called_upon(case.get("wind_down"), case, "wind_down", lead + " to",
+                                                 lead_noun="Upon expiry, the following shall apply")
                 if wsubs:
                     li.append((wlead, dict(sub=wsubs)))
                 elif wlead:
@@ -1119,6 +1121,13 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
             # paragraph with line breaks buried in it. This applies to every
             # notice type, whatever slot the text came from.
             lay = C.layout(it)
+            if not lay["items"]:
+                # A pasted briefing note printed as one 430-word paragraph with
+                # twelve sentences in it. One point belongs in one paragraph.
+                chunks = C.split_paragraph(it)
+                if len(chunks) > 1:
+                    items.extend(_final(x) for x in chunks)
+                    continue
             if lay["items"]:
                 if lay["table"]:
                     items.append((_final(lay["lead"] or "The particulars are as follows:"),
