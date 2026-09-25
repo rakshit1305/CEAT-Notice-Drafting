@@ -83,9 +83,9 @@ def money_tidy(t: str) -> str:
 
 
 # A figure right after one of these is money; one right before a unit is not.
-_MONEY_LEAD = (r"(?:from|to|of|at|upto|up to|deposit|deposits|balance|dues|amount|amounts|target|"
-               r"credit|pay|paid|payable|price|sum|value|fee|fees|penalty|charges?|worth|"
-               r"exceeding|minimum|maximum|least|refund|reimburse|security deposit)")
+_MONEY_LEAD = (r"(?:from|to|of|at|for|towards|upto|up to|deposit|deposits|balance|dues|amount|"
+               r"amounts|target|credit|pay|paid|payable|price|sum|value|fee|fees|penalty|charges?|"
+               r"worth|exceeding|minimum|maximum|least|refund|reimburse|compensation|security deposit)")
 _UNIT_AFTER = (r"(?:units?|days?|kg|kgs|km|kms|tyres?|tubes?|flaps?|metres?|meters?|mm|%|per\s|pcs|"
                r"nos\.?|months?|years?|hours?|weeks?|pieces?|sets?|litres?|liters?)")
 
@@ -99,22 +99,25 @@ def money_full(t: str, words: bool = True) -> str:
         return s_ + (f" ({to_words(v)})" if words else "")
 
     def bare(m):
-        lead, num = m.group(1), m.group(2)
+        lead, cur, num = m.group(1), m.group(2), m.group(3)
         v = to_float(num)
         if v is None or v < 1000:
             return m.group(0)
+        # "for 2026" is a year, not an amount — unless it was written as money
+        if not cur and float(v).is_integer() and 1900 <= v <= 2100 and "," not in num:
+            return m.group(0)
         return f"{lead} {rupees(v)}"
 
-    out = re.sub(r"\b(" + _MONEY_LEAD + r")\s+(?:INR\s*|Rs\.?\s*|\u20b9\s*)?"
+    out = re.sub(r"\b(" + _MONEY_LEAD + r")\s+(INR\s*|Rs\.?\s*|\u20b9\s*)?"
                  r"(\d{4,}(?:\.\d{1,2})?|\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?)"
-                 r"(?!\s*" + _UNIT_AFTER + r")(?![\d.,/])(?!\s*\(Rupees)",
+                 r"(?!\s*" + _UNIT_AFTER + r")(?!\d)(?![.,/]\d)(?!\s*\(Rupees)",
                  bare, t, flags=re.I)
     # already-prefixed amounts: grouping, "/-" and words if not already there
     def prefixed(m):
         v = to_float(m.group(2))
         return m.group(0) if v is None or v < 1000 else rupees(v)
     out = re.sub(r"(?<!\w)(INR|Rs\.?|\u20b9)\s*(\d[\d,]*(?:\.\d{1,2})?)(?:/-)?"
-                 r"(?!\s*\(Rupees)(?![\d.,/])", prefixed, out, flags=re.I)
+                 r"(?!\s*\(Rupees)(?!\d)(?![.,/]\d)(?!/)", prefixed, out, flags=re.I)
     return out
 
 
@@ -684,14 +687,16 @@ def as_items(raw) -> list[str]:
     return [i for i in out if i]
 
 
-def punctuate(items: list[str]) -> list[str]:
-    """Legal list punctuation: semicolons, 'and' before the last, full stop."""
+def punctuate(items: list[str], last: str = ".") -> list[str]:
+    """Legal list punctuation: semicolons, 'and' before the last, then `last` —
+    a full stop when the list ends the sentence, a comma when a closing clause
+    follows ("…; and (d) …, are each denied")."""
     if not items:
         return []
     out = []
     for i, it in enumerate(items):
-        last = i == len(items) - 1
-        end = "." if last else ("; and" if i == len(items) - 2 else ";")
+        is_last = i == len(items) - 1
+        end = last if is_last else ("; and" if i == len(items) - 2 else ";")
         out.append(strip_end(it) + end)
     return out
 
@@ -821,4 +826,68 @@ def fit_terms(raw, case, lead: str) -> tuple[str, list[str]]:
     if len(items) == 1:
         return strip_end(lead) + ": " + end_stop(lower_first(items[0])), []
     return strip_end(lead) + ":", punctuate([cap_first(i) for i in items])
+
+# --------------------------------------------------------------------------
+# structure: points and tables instead of a wall of prose
+#
+# An answer that lists things — invoices with amounts, wind-down steps,
+# mitigation measures, demands — used to print as one long paragraph with line
+# breaks inside it. Every notice type now lays those out as (a), (b), (c)
+# points, or as a table with a total when each line carries an amount.
+# --------------------------------------------------------------------------
+_REF_RX = re.compile(r"(?:invoice|inv|bill|claim|credit note|cn|debit note|dn|order|po|ref|"
+                     r"cheque|chq)\.?\s*(?:no\.?\s*)?[:#-]?\s*([A-Za-z0-9][A-Za-z0-9/\-_.]*\d"
+                     r"[A-Za-z0-9/\-_.]*)", re.I)
+_CODE_RX = re.compile(r"^[•\-*\s]*([A-Za-z0-9][A-Za-z0-9/\-_.]*\d[A-Za-z0-9/\-_.]*)\b")
+_AMT_RX = re.compile(r"(?:INR|Rs\.?|\u20b9)\s*([\d,]+(?:\.\d{1,2})?)", re.I)
+
+
+_SUMMARY_RX = re.compile(r"^\s*(?:the\s+)?(?:total|sub-?total|grand total|aggregate|in all|"
+                         r"altogether)\b", re.I)
+
+
+def _is_item(line: str) -> bool:
+    if _SUMMARY_RX.match(line):
+        return False                      # a total line closes a list, it is not in it
+    if BULLET.match(line):
+        return True
+    # an unbulleted line counts only if it names something AND carries a figure
+    return bool(_AMT_RX.search(line) and (_REF_RX.search(line) or _CODE_RX.match(line)))
+
+
+def layout(text: str) -> dict:
+    """Split a block of text into a lead sentence, its list items and any
+    closing sentence — and, when the items carry amounts, a table."""
+    lines = [l.strip() for l in str(text or "").split("\n") if l.strip()]
+    flags = [_is_item(l) for l in lines]
+    if sum(flags) < 2:
+        return dict(lead=" ".join(lines), items=[], tail="", table=None)
+    first, last = flags.index(True), len(flags) - 1 - flags[::-1].index(True)
+    items = [BULLET.sub("", l).strip() for l in lines[first:last + 1] if l.strip()]
+    return dict(lead=" ".join(lines[:first]).strip(), items=items,
+                tail=" ".join(lines[last + 1:]).strip(), table=money_table(items))
+
+
+def money_table(items: list[str]) -> dict | None:
+    """Reference / date / amount rows, with a total, when the items are money
+    lines. 'Invoice CEAT/PN/2026/0451 dated 18.05.2026, outstanding INR 2,84,000'
+    belongs in a table, not in the middle of a sentence."""
+    rows, total = [], 0.0
+    for it in items:
+        am = _AMT_RX.search(it)
+        if not am:
+            return None
+        val = to_float(am.group(1))
+        ref_m = _REF_RX.search(it) or _CODE_RX.match(it)
+        if not ref_m:
+            return None
+        ds = find_dates(it)
+        rows.append([ref_m.group(1).rstrip(".,;"),
+                     ".".join(reversed(ds[0].split("-"))) if ds else "\u2014",
+                     fmt_amount(val) if val is not None else "\u2014"])
+        total += val or 0
+    if len(rows) < 2:
+        return None
+    rows.append(["Total", "", fmt_amount(total)])
+    return dict(head=["Invoice / reference", "Date", "Amount (INR)"], rows=rows)
 

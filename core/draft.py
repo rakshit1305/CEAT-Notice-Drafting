@@ -25,7 +25,7 @@ MODES_DEFAULT = "BY SPEED POST"
 # --------------------------------------------------------------------------
 @dataclass
 class Block:
-    kind: str                  # p | ol | table | stamp | addr | sig | subject | re
+    kind: str                  # p | ol | list | table | stamp | addr | sig | subject | re
     text: str = ""
     items: list = field(default_factory=list)
     head: list = field(default_factory=list)
@@ -356,7 +356,8 @@ def para_stance(p: dict) -> tuple[str, str, str]:
     """
     n = str(p.get("n", "")).strip()
     stance = str(p.get("stance", "") or "").strip()
-    body = C.clean(p.get("text", ""))
+    # figures in a reply read as money too: "refund of 32000" -> "INR 32,000/-"
+    body = C.money_full(C.clean(p.get("text", "")), words=False)
     body = re.sub(r"^with reference to (?:para|paragraph)\s*\d+[^,]*,\s*", "", body, flags=re.I)
     body = re.sub(r"^the contents of (?:para|paragraph)\s*\d+(?: of the (?:said |legal )?notice)?\s+"
                   r"(?:are|is)\s+(?:specifically |wholly |hereby |all )?denied\.?\s*", "", body, flags=re.I)
@@ -797,8 +798,19 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
         dem = [x for x in rows(case, "demands") if str(x.get("d", "")).strip()]
         denied = [C.strip_end(x["d"]) for x in dem if not str(x.get("resp", "")).startswith("Conceded")]
         if denied and not answered_demands:
-            body.append(Block("p", text="The demands raised in the Said Notice, namely " + "; ".join(denied)
-                                        + ", are wholly untenable and are hereby expressly denied and rejected."))
+            if len(denied) == 1:
+                body.append(Block("p", text="The demand raised in the Said Notice, namely "
+                                            + C.lower_first(C.money_full(denied[0], words=False))
+                                            + ", is wholly untenable and is "
+                                            "hereby expressly denied and rejected."))
+            else:
+                # One long sentence listing four demands is hard to read and
+                # harder to answer paragraph by paragraph later.
+                body.append(Block("p", text="The demands raised in the Said Notice, namely:"))
+                body.append(Block("list", items=[_final(x) for x in C.punctuate(
+                    [C.cap_first(C.money_full(d, words=False)) for d in denied], last=",")]))
+                body.append(Block("p", text="are each wholly untenable and are hereby expressly denied "
+                                            "and rejected."))
         elif denied:
             note("The demands are already answered in the para-wise reply, so the separate “demands are "
                  "denied” paragraph was not repeated.")
@@ -1081,12 +1093,43 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
     if opening:
         blocks.append(Block("p", text=_final(opening)))
     for b in body:
+        if b.kind == "list":
+            blocks.append(b)
+            continue
+        lay = C.layout(b.text)
+        if lay["items"]:
+            blocks.append(Block("p", text=_final(lay["lead"] or "The particulars are as follows:")))
+            if lay["table"]:
+                blocks.append(Block("table", head=lay["table"]["head"], rows=lay["table"]["rows"]))
+            else:
+                blocks.append(Block("list", items=[_final(x) for x in C.punctuate(lay["items"])]))
+            if lay["tail"]:
+                blocks.append(Block("p", text=_final(lay["tail"])))
+            continue
         b.text = _final(b.text)
         blocks.append(b)
     if li:
         items = []
         for it in li:
-            items.append((_final(it[0]), it[1]) if isinstance(it, tuple) else _final(it))
+            if isinstance(it, tuple):
+                items.append((_final(it[0]), it[1]))
+                continue
+            # Anything that lists things is laid out as points, or as a table
+            # with a total when each line carries an amount — never as a
+            # paragraph with line breaks buried in it. This applies to every
+            # notice type, whatever slot the text came from.
+            lay = C.layout(it)
+            if lay["items"]:
+                if lay["table"]:
+                    items.append((_final(lay["lead"] or "The particulars are as follows:"),
+                                  lay["table"]))
+                else:
+                    items.append((_final(lay["lead"] or "The particulars are as follows:"),
+                                  dict(sub=[_final(x) for x in C.punctuate(lay["items"])])))
+                if lay["tail"]:
+                    items.append(_final(lay["tail"]))
+            else:
+                items.append(_final(it))
         if prior:
             items.append(_final(prior))
         blocks.append(Block("ol", items=items))
@@ -1137,6 +1180,10 @@ def to_text(kind: str, case: dict) -> str:
                 else:
                     out.append(f"{i}. {it}")
                 out.append("")
+        elif b.kind == "list":
+            for j, it in enumerate(b.items):
+                out.append(f"   ({chr(97 + j)}) {it}")
+            out.append("")
         else:
             out.append(b.text)
             out.append("")
@@ -1231,6 +1278,13 @@ def to_docx(kind: str, case: dict, specimen: bool = False) -> bytes:
                             r = c.paragraphs[0].add_run(str(v))
                             r.font.size = Pt(9)
                     doc.add_paragraph().paragraph_format.space_after = Pt(4)
+        elif b.kind == "list":
+            for j, it in enumerate(b.items):
+                lp = doc.add_paragraph()
+                lp.paragraph_format.left_indent = Inches(0.4)
+                lp.paragraph_format.space_after = Pt(5)
+                lp.paragraph_format.line_spacing = 1.35
+                lp.add_run(f"({chr(97 + j)})\t{it}")
         elif b.kind in ("stamp", "subject"):
             para(b.text, bold=True, underline=b.underline, size=10.5, space_after=4)
         elif b.kind in ("addr", "sig"):
