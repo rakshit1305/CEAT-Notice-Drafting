@@ -957,8 +957,9 @@ _LISTY = re.compile(r"^(?:payment|removal|return|revocation|cessation|delivery|r
                     r"ure|ing))\b", re.I)
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z(\u201c])")
 # "Report No. TS/WCA/..." and "Mr. Reddy" are not sentence ends
-_ABBREV = re.compile(r"\b(?:No|Nos|Mr|Mrs|Ms|Dr|Shri|Smt|Ltd|Pvt|Co|Corp|Inc|Rs|INR|Sr|Jr|vs|viz|"
-                     r"etc|i\.e|e\.g|Cl|Sec|Art|Ref|Dt|Regn|Reg|St|Rd)\.$", re.I)
+_ABBREV = re.compile(r"(?:\b|\W)(?:No|Nos|Mr|Mrs|Ms|Dr|Shri|Smt|Ltd|Pvt|Co|Corp|Inc|Rs|INR|Sr|Jr|"
+                     r"vs|viz|etc|i\.e|e\.g|p\.a|a\.m|p\.m|w\.e\.f|u/s|Cl|Sec|Art|Ref|Dt|Regn|"
+                     r"Reg|St|Rd)\.$", re.I)
 
 
 def sentences(t: str) -> list[str]:
@@ -1039,3 +1040,31 @@ def house_you(t: str) -> tuple[str, bool]:
         out = re.sub(a, b, out)
     return out, True
 
+
+def polish(t: str, sentence: bool = True) -> str:
+    """Small grammar and punctuation faults a reader would notice.
+
+    A double space, a missing capital after a full stop, a space before a comma,
+    a paragraph that stops without a full stop. None of them change meaning;
+    all of them make a notice look unchecked.
+    """
+    t = re.sub(r"[ \t]{2,}", " ", str(t or "")).strip()
+    if not t:
+        return t
+    t = re.sub(r"\s+([,;:.!?])", r"\1", t)                  # no space before punctuation
+    t = re.sub(r"([,;:])(?=[^\s\d])", r"\1 ", t)             # a space after one
+    t = re.sub(r"\(\s+", "(", t)
+    t = re.sub(r"\s+\)", ")", t)
+    t = re.sub(r"\.{2,}", ".", t)
+    # a capital after a sentence end, except after an abbreviation
+    def cap(m):
+        before = (t[:m.start()] + m.group(1)).strip()[-8:]      # keep the stop itself
+        return m.group(0) if _ABBREV.search(before) else m.group(1) + " " + m.group(2).upper()
+    t = re.sub(r"([.!?])\s+([a-z])", cap, t)
+    if not sentence:
+        return t          # a list item or a continuation clause: leave both ends alone
+    t = cap_first(t)
+    # every paragraph ends with a stop, unless it introduces a list or a table
+    if t[-1] not in ".:!?;,\u201d)":
+        t += "."
+    return t

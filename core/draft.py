@@ -145,6 +145,9 @@ def noticee_block(case, kind: str = "") -> str:
         attn = contact_line(case, kind)
         if attn:
             lines += ["", attn]
+    code = str(case.get("dealer_code") or "").strip()
+    if code:
+        lines.insert(min(2, len(lines)), f"(Dealer Code: {code})")
     em = str(case.get("email") or "").strip()
     if em:
         lines += ["", f"Email: {em}"]
@@ -291,8 +294,16 @@ def _clauses(s: str) -> str:
                   r"Clauses \1", s)
 
 
+def _frag(s: str) -> str:
+    """A list item or a clause that continues the sentence before it: polished,
+    but not capitalised and not given a full stop of its own."""
+    return C.polish(C.house_dates(C.tidy(_clauses(s))), sentence=False)
+
+
 def _final(s: str) -> str:
-    return C.tidy(_clauses(s))
+    """Last pass over every paragraph: house dates, clause plurals, punctuation
+    and capitalisation. Nothing reaches the page without going through here."""
+    return C.polish(C.house_dates(C.tidy(_clauses(s))))
 
 
 def schedule_block(case: dict) -> tuple | None:
@@ -303,12 +314,25 @@ def schedule_block(case: dict) -> tuple | None:
     if not sched:
         return None
     total = sum(to_float(r.get("amt")) or 0 for r in sched)
+    groups: dict[str, list] = {}
+    for r in sched:
+        key = str(r.get("finding") or "").strip()
+        if key:
+            groups.setdefault(key, []).append(to_float(r.get("amt")) or 0)
     body = [[r.get("ref") or blank("reference"), fmt_date(r.get("date")) or "—",
              fmt_amount(r.get("amt")) or "—", r.get("finding") or "—"] for r in sched]
     if total:
         body.append(["Total", "", fmt_amount(total), ""])
-    return ("The particulars are set out in the Schedule below, which forms part of this notice:",
-            dict(head=["Reference", "Date", "Amount (INR)", "Finding / remark"], rows=body))
+    lead = "The particulars are set out in the Schedule below, which forms part of this notice"
+    if len(groups) > 1:
+        # "in 4 cases, the serial number had been buffed; in 4 cases, …" — the
+        # reader should not have to count the rows themselves.
+        bits = [f"in {len(v)} case{'s' if len(v) != 1 else ''}, {C.lower_first(k)}"
+                for k, v in groups.items()]
+        lead += ". In summary, " + "; ".join(bits[:-1]) + ("; and " + bits[-1] if len(bits) > 1
+                                                           else bits[0]) + ". The particulars are"
+    return (lead + ":", dict(head=["Reference", "Date", "Amount (INR)", "Finding / remark"],
+                             rows=body))
 
 
 def parties_para(case: dict, goods: str = "the Products") -> str:
@@ -465,10 +489,22 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
              "against them personally, a company's director is usually a contact rather than a "
              "party — put the name in ‘Kind attention’ if that is the case here.")
     if kind == "consumer":
-        head.append(Block("addr", text="To,\n" + V(case, "advocate_name", "advocate") + ", Advocate\n"
-                                       + V(case, "advocate_address", "advocate's address")))
-        head.append(Block("p", text=D(case, "reply_date", "date of this reply")))
-        head.append(Block("re", text="Re: Your Notice dated " + D(case, "notice_date", "date of the incoming notice")
+        # the same heading treatment every other notice type gets
+        head.append(Block("p", text="Date: " + D(case, "reply_date", "date of this reply")))
+        head.append(Block("stamp", text=case.get("mode") or MODES_DEFAULT, bold=True))
+        head.append(Block("stamp", text="WITHOUT PREJUDICE", bold=True, underline=True))
+        addr = "To,\n" + V(case, "advocate_name", "advocate") + ", Advocate\n" \
+               + V(case, "advocate_address", "advocate's address")
+        em_ = str(case.get("email") or "").strip()
+        if em_:
+            addr += f"\n\nCopy by email: {em_}"
+        head.append(Block("addr", text=addr))
+        ref_ = str(case.get("notice_ref") or "").strip()
+        who_ = str(case.get("client_name") or "").strip()
+        head.append(Block("re", text="Re: Your Notice dated "
+                                     + D(case, "notice_date", "date of the incoming notice")
+                                     + (f" bearing Ref. No. {ref_}" if ref_ else "")
+                                     + (f", issued on behalf of {who_}" if who_ else "")
                                      + " (“Said Notice”)"))
         subject = "Reply to your Said Notice."
     else:
@@ -769,6 +805,7 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                 "Manufacturers on a principal-to-principal basis. After such sale, we are not aware of onward "
                 "sales by those dealers/OEMs to their customers/consumers.")))
         if case.get("blk_b") is not False:
+            wnote = C.strip_end(C.clean(case.get("warranty_note")))
             body.append(Block("p", text="B) " + BL(
                 "consumer", "**(B) Warranty procedure:**",
                 "The Products are subject to the warranty obligations detailed on our Company website, along "
@@ -776,7 +813,11 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                 "be submitted to the dealer/OEM/us for inspection; on receipt we issue a claim receipt, our "
                 "Technical Service Engineer examines the item, and the disposition is communicated to the "
                 "consumer with a copy of the inspection report. For sizes that cannot be transported, our "
-                "Engineer may inspect at the consumer's premises if desired.")))
+                "Engineer may inspect at the consumer's premises if desired.")
+                + (" " + C.end_stop(C.cap_first(wnote)) if wnote else "")))
+            if wnote:
+                note("The warranty paragraph carries an added sentence from your answer. It is not "
+                     "part of CEAT's approved block — legal should confirm the wording.")
         if case.get("blk_c") is not False:
             status = dealer_status(case)
             dealer = C.strip_end(C.clean(case.get("dealer"))) or blank("dealer / OEM")
@@ -866,7 +907,9 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
         if not _paras:
             body.append(Block("p", text=blank("para-wise responses — one per numbered paragraph")))
 
-        dem = [x for x in rows(case, "demands") if str(x.get("d", "")).strip()]
+        # A demand of one or two characters is a placeholder, not a demand: the
+        # reply once printed "(a) A; (b) B; (c) C; and (d) D".
+        dem = [x for x in rows(case, "demands") if len(str(x.get("d", "")).strip()) > 3]
         denied = [C.strip_end(x["d"]) for x in dem if not str(x.get("resp", "")).startswith("Conceded")]
         if denied and not answered_demands:
             if len(denied) == 1:
@@ -874,14 +917,32 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                                             + C.lower_first(C.money_full(denied[0], words=False))
                                             + ", is wholly untenable and is "
                                             "hereby expressly denied and rejected."))
+            elif any(str(x.get("note", "")).strip() for x in dem
+                     if not str(x.get("resp", "")).startswith("Conceded")):
+                # each demand answered with its own reason
+                body.append(Block("p", text="As to the demands raised in the Said Notice, we say as "
+                                            "follows:"))
+                items_ = []
+                for x in dem:
+                    if str(x.get("resp", "")).startswith("Conceded"):
+                        continue
+                    why = C.strip_end(C.clean(x.get("note")))
+                    d_ = C.lower_first(C.money_full(C.strip_end(x["d"]), words=False))
+                    # "The demand for replace four tyres" -> "The demand that we replace…"
+                    stem = ("The demand that we " if C.shape(d_) == "verb" else "The demand for ")
+                    line = (stem + d_ + " is denied and rejected"
+                            + (". " + C.end_stop(C.cap_first(C.money_full(why, words=False)))
+                               if why else "."))
+                    items_.append(line)
+                body.append(Block("list", items=[_final(i) for i in items_]))
             else:
                 # One long sentence listing four demands is hard to read and
                 # harder to answer paragraph by paragraph later.
                 body.append(Block("p", text="The demands raised in the Said Notice, namely:"))
-                body.append(Block("list", items=[_final(x) for x in C.punctuate(
+                body.append(Block("list", items=[_frag(x) for x in C.punctuate(
                     [C.cap_first(C.money_full(d, words=False)) for d in denied], last=",")]))
-                body.append(Block("p", text="are each wholly untenable and are hereby expressly denied "
-                                            "and rejected."))
+                body.append(Block("p", text="Each of the aforesaid demands is wholly untenable and "
+                                            "is hereby expressly denied and rejected."))
         elif denied:
             note("The demands are already answered in the para-wise reply, so the separate “demands are "
                  "denied” paragraph was not repeated.")
@@ -889,11 +950,21 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
             if str(x.get("resp", "")).startswith("Conceded"):
                 body.append(Block("p", text=f"In respect of your client's demand for {C.strip_end(x['d'])}, "
                                             f"{str(x.get('note','')).strip() or 'we shall act as stated separately'}."))
+        offer = C.strip_end(C.clean(case.get("goodwill")))
+        if offer:
+            body.append(Block("p", text="Notwithstanding and without prejudice to the whole of the "
+                                        "foregoing, and purely in the interest of customer goodwill "
+                                        "and without admission of liability of any nature, we "
+                                        + C.lower_first(offer)
+                                        + ". This offer is made without prejudice to our rights and "
+                                          "contentions, all of which are expressly reserved."))
         body.append(Block("p", text=BL(
             "consumer", "**Closing:**",
             "Under such circumstances, notwithstanding the above, if your client initiates proceedings against "
             "us, kindly note that we shall have no alternative but to defend the same at your client's entire "
             "risk as to the costs and consequences thereof.")))
+        body.append(Block("p", text="All our rights, contentions and remedies in law and in equity "
+                                    "are hereby expressly reserved."))
 
     # -------------------------------------------- contract notice types ---
     # These four (termination, renewal, force majeure, price) are NON-STANDARD in
@@ -996,7 +1067,7 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                              "say which — citing the termination clause as the source of the obligation "
                              "misstates the agreement.")
                 lead, subs = C.fit_required_to(case.get("obligation"), case, ocl or blank("clause"))
-                li.append((lead, dict(sub=subs)) if subs else
+                li.append((lead, dict(sub=[_frag(x) for x in subs])) if subs else
                           (lead or f"In terms of Clause {ocl or blank('clause')}, you were required to "
                            + blank("the obligation")))
                 facts = C.fit_failed_as(case.get("facts"), case)
@@ -1011,6 +1082,15 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
             sch = schedule_block(case)
             if sch:
                 li.append(sch)
+            # The sentence that joins the facts to the right being exercised.
+            ocl2 = str(case.get("obligation_clause") or "").strip()
+            if str(case.get("ground", "")).startswith("Breach"):
+                li.append(f"You are thus in breach of "
+                          + (f"Clause {ocl2} of the Agreement" if ocl2 else "the Agreement")
+                          + f". Under Clause {cl} of the Agreement, the Company is entitled to "
+                            "terminate the Agreement by written notice on that ground"
+                          + (", without any cure period"
+                             if not str(case.get("cure_given_date") or "").strip() else "") + ".")
             # Most agreements make termination bite when the notice is received,
             # not on a date the sender picks.
             if str(case.get("effect_on_receipt", "")).strip().lower().startswith("y"):
@@ -1054,9 +1134,17 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
             wlead, wsubs = C.fit_called_upon(wd_src, case, "wind_down", lead + " to",
                                              lead_noun="Upon termination, the following shall apply")
             if wsubs:
-                li.append((wlead, dict(sub=wsubs)))
+                li.append((wlead, dict(sub=[_frag(x) for x in wsubs])))
             else:
                 li.append(wlead or lead + " to " + blank("wind-down obligations") + ".")
+            owed2 = to_float(case.get("dues"))
+            li.append("In case you fail to comply with the aforesaid"
+                      + (f", and to pay the said sum of {inr(owed2 - (to_float(case.get('deposit_held')) or 0))}"
+                         if owed2 else "")
+                      + ", within the period stated above from the date of receipt of this notice, "
+                        "the Company shall be constrained to initiate appropriate legal proceedings "
+                        "against you, at your entire risk as to the costs and consequences arising "
+                        "therefrom.")
             li.append(TP("termination", "This termination is without prejudice",
                          "This termination is without prejudice to the Company's rights and remedies, all "
                          "of which are expressly reserved, including for recovery of dues and losses."))
@@ -1080,7 +1168,7 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                         f"Agreement for a further term of {term}"
                         + (" on the following revised terms" if has_terms else " on the existing terms"))
                 tlead, tsubs = C.fit_terms(case.get("revised_terms"), case, lead)
-                li.append((tlead, dict(sub=tsubs)) if tsubs else tlead)
+                li.append((tlead, dict(sub=[_frag(x) for x in tsubs])) if tsubs else tlead)
                 by = D(case, "confirm_by", "confirm-by date")
                 li.append(f"Kindly confirm your acceptance of the aforesaid terms in writing on or before "
                           f"{by}. The renewal is offered on the terms stated above and is open for "
@@ -1103,7 +1191,7 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                 wlead, wsubs = C.fit_called_upon(case.get("wind_down"), case, "wind_down", lead + " to",
                                                  lead_noun="Upon expiry, the following shall apply")
                 if wsubs:
-                    li.append((wlead, dict(sub=wsubs)))
+                    li.append((wlead, dict(sub=[_frag(x) for x in wsubs])))
                 elif wlead:
                     li.append(wlead)
             li.append("This notice is without prejudice to the Company’s rights and remedies, all of "
@@ -1143,7 +1231,7 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                                        r.get("sched") or blank("scheduled quantity"),
                                        r.get("done") or "Nil",
                                        r.get("pend") or blank("pending quantity"),
-                                       fmt_date(r.get("due")) or r.get("due") or blank("due date")]
+                                       fmt_date(r.get("due")) or blank("due date")]
                                       for r in qty]
                                      + [["Total", f"{tot['sched']:g}", f"{tot['done']:g}",
                                          f"{tot['pend']:g}", ""]])))
@@ -1158,7 +1246,7 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                 case.get("mitigation"), case, "mitigation",
                 "The Company is taking the following steps to mitigate the effect of the said event")
             if msubs:
-                li.append((mlead, dict(sub=msubs)))
+                li.append((mlead, dict(sub=[_frag(x) for x in msubs])))
             else:
                 li.append(mlead or "The Company is taking the following steps to mitigate the effect of "
                                    "the said event: " + blank("mitigation steps") + ".")
@@ -1177,7 +1265,7 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
             keep = " The Company will keep you informed and resume performance as soon as reasonably " \
                    "practicable."
             if rsubs:
-                li.append((rlead, dict(sub=rsubs)))
+                li.append((rlead, dict(sub=[_frag(x) for x in rsubs])))
                 li.append(keep.strip())
             else:
                 li.append(rlead + keep)
@@ -1250,7 +1338,7 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
             if lay["table"]:
                 blocks.append(Block("table", head=lay["table"]["head"], rows=lay["table"]["rows"]))
             else:
-                blocks.append(Block("list", items=[_final(x) for x in C.punctuate(lay["items"])]))
+                blocks.append(Block("list", items=[_frag(x) for x in C.punctuate(lay["items"])]))
             if lay["tail"]:
                 blocks.append(Block("p", text=_final(lay["tail"])))
             continue
@@ -1280,7 +1368,7 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                                   lay["table"]))
                 else:
                     items.append((_final(lay["lead"] or "The particulars are as follows:"),
-                                  dict(sub=[_final(x) for x in C.punctuate(lay["items"])])))
+                                  dict(sub=[_frag(x) for x in C.punctuate(lay["items"])])))
                 if lay["tail"]:
                     items.append(_final(lay["tail"]))
             else:

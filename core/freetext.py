@@ -190,6 +190,11 @@ def _parse(kind: str, qid: str, raw: str, case: dict) -> dict:
             # drop the whole "Email: x@y" phrase, not just the address
             t = re.sub(r"(?:e-?mail|mail id)?\s*[:\-]?\s*" + re.escape(em.group(0)),
                        " ", t, flags=re.I)
+        dc = re.search(r"(?:dealer|account|customer)\s*(?:code|no\.?|id)\s*[:#-]?\s*"
+                       r"([A-Za-z0-9][A-Za-z0-9/\-_]*\d[A-Za-z0-9/\-_]*)", t, re.I)
+        if dc:
+            v["dealer_code"] = dc.group(1).rstrip(".,;")
+            t = t[:dc.start()] + " " + t[dc.end():]
         rf = re.search(r"(?:ref(?:erence)?)\.?\s*(?:no\.?)?\s*[:#-]?\s*"
                        r"([A-Za-z0-9&][A-Za-z0-9&/\-_.]*\d[A-Za-z0-9&/\-_.]*)", t, re.I)
         if rf and qid == "who":

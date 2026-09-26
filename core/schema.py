@@ -63,6 +63,8 @@ LABELS = {
     "clause_no": "Clause", "obligation_clause": "Clause containing the obligation",
     "attn_name": "Kind attention", "attn_desig": "Designation (kind attention)",
     "email": "Email address", "notice_ref": "Their notice reference",
+    "dealer_code": "Dealer / account code", "warranty_note": "Warranty scope note",
+    "goodwill": "Without-prejudice offer",
     "deposit_held": "Security deposit held", "effect_on_receipt": "Takes effect on receipt",
     "fm_continue": "If the event continues", "obligation": "The obligation", "breach_facts": "Particulars of the breach",
     "cure_period": "Cure period", "consequences": "Consequences if not cured",
@@ -123,6 +125,11 @@ FIELD_HELP = {
     "quantities": "force majeure: the affected deliveries — one row per month/period with scheduled, "
                   "delivered, pending and the due date",
     "email": "the recipient's email address, if the notice is also being sent by email",
+    "dealer_code": "the dealer or account code identifying this dealership, e.g. CEAT/S/HYD/0342",
+    "warranty_note": "consumer reply: what the warranty does and does not cover, if legal wants it "
+                     "spelt out beyond the standard block",
+    "goodwill": "consumer reply: an offer made without admission of liability, e.g. to inspect the "
+                "tyres within 15 days",
     "notice_ref": "consumer reply: the reference number printed on the incoming notice",
     "deposit_held": "termination: the security deposit the Company holds, digits only",
     "schedule": "the item-by-item particulars behind the breach — one row per claim, invoice or "
@@ -204,7 +211,8 @@ _PARTY = [
                ("Company + directors", "Company + directors", "Joint & several liability"),
                ("Partnership + partners", "Partnership firm + partners", "Joint & several liability")]),
     Q("addr", "Who is it addressed to — full name(s) and address?",
-      ["noticee_name", "noticee_address", "attn_name", "attn_desig", "email"], attach=True,
+      ["noticee_name", "noticee_address", "attn_name", "attn_desig", "email", "dealer_code"],
+      attach=True,
       hint="For a sole proprietorship, give the proprietor's own name as well as the firm — a "
            "proprietorship is not a separate legal person.",
       ph="e.g. M/s Sharma Tyres, Prop. Mr. Rakesh Sharma, Shop 14, MG Road, Jaipur – 302001. "
@@ -294,7 +302,18 @@ QUESTIONS: dict[str, list[Q]] = {
           ph="e.g. claim received 12.05.2026; impact damage, not a manufacturing defect; communicated 20.05.2026"),
         Q("reply", "How should each paragraph be answered?", ["paras"], kind="table", table="paras"),
         Q("demands", "What did they demand, and is any of it conceded?", ["demands"],
-          kind="table", table="demands"),
+          kind="table", table="demands",
+          hint="Put the reason for rejecting each demand in the Note column — it is printed against "
+               "that demand in the reply."),
+        Q("offer", "Any offer to make, without admitting liability?", ["goodwill"],
+          hint="An offer to inspect usually settles these before a complaint is filed. It prints as "
+               "made without prejudice and without admission.",
+          ph="e.g. willing to inspect the tyres within 15 days of receipt, against a claim receipt"),
+        Q("wscope", "Anything to add about what the warranty does and does not cover?",
+          ["warranty_note"],
+          hint="Optional, added to the standard warranty paragraph. Legal should approve the wording.",
+          ph="e.g. the warranty covers manufacturing defects only; it guarantees no tread life or "
+             "mileage and excludes under-inflation, wrong alignment, overloading and impact damage"),
         Q("rdate", "What date should the reply carry?", ["reply_date"], kind="date"),
         # Not _SEND[1:]: that includes "What date should the notice carry?", which
         # for a reply wrote TODAY into notice_date — the field the "Re: Your Notice
