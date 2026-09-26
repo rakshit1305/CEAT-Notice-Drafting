@@ -15,7 +15,7 @@ from . import skill_loader as SK
 from . import template as T
 from .config import blank
 from .schema import label, part_paid, rows
-from .words import fmt_amount, fmt_date, house_words, inr, to_float, to_words
+from .words import fmt_amount, fmt_date, house_words, inr, parse_date, to_float, to_words
 
 MODES_DEFAULT = "BY SPEED POST"
 
@@ -102,8 +102,12 @@ def contact_line(case, kind: str = "") -> str:
 
 def noticee_block(case, kind: str = "") -> str:
     lines = []
+    # Only when the user actually named a contact. Demoting whoever was listed
+    # cost a renewal notice its Noticees 2 and 3 — and partners are parties to
+    # the agreement, not contacts.
     company_only = (kind in CONTACT_ONLY
-                    and str(case.get("noticee_type", "")).startswith("Company"))
+                    and str(case.get("noticee_type", "")).startswith("Company")
+                    and str(case.get("attn_name") or "").strip() != "")
     if multi(case) and company_only:
         lines += [V(case, "noticee_name"), V(case, "noticee_address")]
         attn = contact_line(case, kind)
@@ -141,6 +145,9 @@ def noticee_block(case, kind: str = "") -> str:
         attn = contact_line(case, kind)
         if attn:
             lines += ["", attn]
+    em = str(case.get("email") or "").strip()
+    if em:
+        lines += ["", f"Email: {em}"]
     return "\n".join(lines)
 
 
@@ -288,6 +295,49 @@ def _final(s: str) -> str:
     return C.tidy(_clauses(s))
 
 
+def schedule_block(case: dict) -> tuple | None:
+    """The item-by-item particulars as a Schedule with a total. For a notice
+    that rests on 19 false claims or a run of unpaid invoices, these are the
+    evidence — a sentence saying "19 claims" is not."""
+    sched = [r for r in rows(case, "schedule") if str(r.get("ref", "")).strip()]
+    if not sched:
+        return None
+    total = sum(to_float(r.get("amt")) or 0 for r in sched)
+    body = [[r.get("ref") or blank("reference"), fmt_date(r.get("date")) or "—",
+             fmt_amount(r.get("amt")) or "—", r.get("finding") or "—"] for r in sched]
+    if total:
+        body.append(["Total", "", fmt_amount(total), ""])
+    return ("The particulars are set out in the Schedule below, which forms part of this notice:",
+            dict(head=["Reference", "Date", "Amount (INR)", "Finding / remark"], rows=body))
+
+
+def parties_para(case: dict, goods: str = "the Products") -> str:
+    """Who the noticee is — the paragraph the cheque and recovery notices have
+    always carried and the contract notices did not, which is how a
+    partnership and its partners' joint and several liability disappeared."""
+    typ = str(case.get("noticee_type", ""))
+    dirs = [d.get("name", "") for d in rows(case, "directors") if d.get("name")]
+    if typ.startswith("Partnership"):
+        return (f"That you Noticee No. 1, {V(case,'noticee_name')}, are a partnership firm "
+                f"registered under the Indian Partnership Act, 1932, engaged in the business of "
+                f"purchase and sale of {goods}"
+                + (f"; and {_dir_phrase(dirs)}, are its partners responsible for its management and "
+                   "day-to-day operations, and are jointly and severally liable for the obligations "
+                   "of the said firm." if dirs else "."))
+    if typ.startswith("Company"):
+        return (f"That you Noticee No. 1, {V(case,'noticee_name')}, are a company registered in "
+                f"India engaged in the business of purchase and sale of {goods}"
+                + (f"; and {_dir_phrase(dirs)}, are its directors responsible for its management "
+                   "and day-to-day operations." if dirs else "."))
+    return CL("Noticee — individual",
+              "That you are the sole proprietor and the person in control and management of the "
+              "proprietorship concern {{FIRM_NAME}}, having your office and residential address at "
+              "{{ADDRESS}}, engaged in the business of purchase and sale of Goods.",
+              dict(FIRM_NAME=V(case, "firm_name", "firm name"),
+                   ADDRESS=V(case, "noticee_address"))).replace(
+        "purchase and sale of Goods", f"purchase and sale of {goods}")
+
+
 def _pct(row: dict) -> str:
     """The % change cell: as given, or worked out from the two prices."""
     p = str(row.get("pct") or "").strip()
@@ -318,6 +368,15 @@ def _prior_para(kind: str, case: dict, note) -> str:
     if not pd_ or not pref:
         note("An earlier notice was reported, but its date or what it covered is missing, so the "
              "prior-notice paragraph could not be added. Give both to include it.")
+        return ""
+    # A reminder is not a separate notice. Treating one as such produced a
+    # paragraph saying the demand "does not include" the very sum demanded.
+    if re.search(r"remind|follow[- ]?up|email|e-mail|whatsapp|call|letter of demand", pref, re.I):
+        note("What was described as an earlier notice reads as a reminder "
+             f"(“{pref[:60]}…”). Reminders are not excluded from this demand, so the "
+             "prior-notice paragraph was left out and the reminders are recited in the facts "
+             "instead. If a formal notice was in fact issued for a different amount, say which "
+             "amount it covered.")
         return ""
     return CL("Prior notice reference",
               "This notice pertains solely to {{CURRENT_INSTRUMENT_OR_BREACH}} and the amount/relief "
@@ -395,11 +454,16 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
 
     multi_ = multi(case)
     if (kind in CONTACT_ONLY and str(case.get("noticee_type", "")).startswith("Company")
+            and str(case.get("attn_name") or "").strip()
             and [d for d in rows(case, "directors") if str(d.get("name", "")).strip()]):
-        note("The named individual is shown as “Kind Attn.”, not as a noticee. This notice asserts "
-             "nothing against anyone personally, and naming a director as a noticee implies he is "
-             "personally answerable. Say so under ‘Anything else’ if you do intend to address him "
-             "as a party.")
+        note("A contact person was given, so the named individuals are shown as “Kind Attn.” rather "
+             "than as noticees. This notice asserts nothing against anyone personally. Clear the "
+             "‘Kind attention’ field if they should be addressed as parties.")
+    elif (kind in CONTACT_ONLY and str(case.get("noticee_type", "")).startswith("Company")
+          and [d for d in rows(case, "directors") if str(d.get("name", "")).strip()]):
+        note("The individuals named are addressed as Noticees. For a notice that alleges nothing "
+             "against them personally, a company's director is usually a contact rather than a "
+             "party — put the name in ‘Kind attention’ if that is the case here.")
     if kind == "consumer":
         head.append(Block("addr", text="To,\n" + V(case, "advocate_name", "advocate") + ", Advocate\n"
                                        + V(case, "advocate_address", "advocate's address")))
@@ -849,6 +913,7 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                          f"CEAT Limited (\"the Company\") is a Public Limited Company incorporated under the "
                          f"Companies Act, 1956, having its Registered Office at {ro}, engaged in the manufacture "
                          f"and sale of Tyres, Tubes and Flaps."))
+            li.append(parties_para(case))
             li.append(TP("breach", "The Company and you entered into",
                          "The Company and you entered into {{AGREEMENT_NAME}} dated {{AGREEMENT_DATE}} (\"the "
                          "Agreement\").", av))
@@ -871,9 +936,21 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
             li.append(fx or (p4 or "You are in breach of the said obligation, in that {{BREACH_FACTS}}. "
                              "Despite the Company's follow-ups, the breach subsists.").replace(
                 "{{BREACH_FACTS}}", blank("particulars of the breach")))
-            li.append(TP("breach", "You are hereby called upon to remedy",
-                         "You are hereby called upon to remedy/cure the aforesaid breach within {{CURE_PERIOD}} "
-                         "from the date of receipt of this notice.", av))
+            sch = schedule_block(case)
+            if sch:
+                li.append(sch)
+            cure = TP("breach", "You are hereby called upon to remedy",
+                      "You are hereby called upon to remedy/cure the aforesaid breach within "
+                      "{{CURE_PERIOD}} from the date of receipt of this notice.", av)
+            # Say what curing it costs: "cure the breach" with no figure leaves
+            # the other side to decide what curing means.
+            due_ = to_float(case.get("dues")) or to_float(case.get("amount"))
+            if due_:
+                rate_ = str(case.get("interest") or "").strip()
+                cure = C.strip_end(cure) + f", by paying to the Company the sum of {inr(due_)} " \
+                    f"({to_words(due_)})" + (f", together with interest at {rate_}% per annum until "
+                                             "realisation" if rate_ else "") + "."
+            li.append(cure)
             p6 = T.para("breach", "Should you fail to cure the breach")
             if p6 is None:
                 T.record("breach", "paragraph beginning “Should you fail to cure the breach”")
@@ -892,6 +969,7 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                        f"manufacture and sale of Tyres, Tubes and Flaps.")
             li.append(intro)
             subject = f"Notice of Termination of {agr} dated {dt}."
+            li.append(parties_para(case))
             li.append(TP("termination", "The Company and you entered into",
                          "The Company and you entered into {{AGREEMENT_NAME}} dated {{AGREEMENT_DATE}} "
                          "(\"the Agreement\"), governing {{SUBJECT_OF_AGREEMENT}}.",
@@ -930,10 +1008,31 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                         cure += f", which lapsed on {fmt_date(case['cure_lapsed_date'])}"
                     cure += "."
                 li.append((facts or "You have failed to do so, as " + blank("what happened")) + cure)
-            li.append(TP("termination", "Accordingly, the Company hereby gives notice of termination",
-                         "Accordingly, the Company hereby gives notice of termination of the Agreement "
-                         "under Clause {{CLAUSE_NO}}, with effect from {{EFFECTIVE_DATE}}.",
-                         dict(CLAUSE_NO=cl, EFFECTIVE_DATE=D(case, "effective_date"))))
+            sch = schedule_block(case)
+            if sch:
+                li.append(sch)
+            # Most agreements make termination bite when the notice is received,
+            # not on a date the sender picks.
+            if str(case.get("effect_on_receipt", "")).strip().lower().startswith("y"):
+                li.append(f"Accordingly, the Company hereby gives notice of termination of the "
+                          f"Agreement under Clause {cl}, with immediate effect, such termination "
+                          "taking effect upon your receipt of this notice.")
+            else:
+                li.append(TP("termination", "Accordingly, the Company hereby gives notice of termination",
+                             "Accordingly, the Company hereby gives notice of termination of the Agreement "
+                             "under Clause {{CLAUSE_NO}}, with effect from {{EFFECTIVE_DATE}}.",
+                             dict(CLAUSE_NO=cl, EFFECTIVE_DATE=D(case, "effective_date"))))
+            # deposit first, then the balance — the order the money actually moves
+            dep = to_float(case.get("deposit_held"))
+            owed = to_float(case.get("dues"))
+            if dep:
+                t_ = (f"The Company holds a security deposit of {inr(dep)} ({to_words(dep)}), which "
+                      "it hereby appropriates towards the amounts due from you")
+                if owed and owed > dep:
+                    bal = owed - dep
+                    t_ += (f" of {inr(owed)} ({to_words(owed)}), leaving a balance of {inr(bal)} "
+                           f"({to_words(bal)}) payable by you")
+                li.append(t_ + ".")
             lead = "Upon termination, you are called upon"
             wd_raw = str(case.get("wind_down") or "")
             dues_txt = str(case.get("dues") or "").strip()
@@ -943,7 +1042,16 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                 re.escape(re.sub(r"[^\d]", "", dues_txt)[:6]), re.sub(r"[^\d]", "", wd_raw))
             if dues_txt and dues_shown:
                 lead += f" to clear all outstanding dues of {M(case,'dues')} and"
-            wlead, wsubs = C.fit_called_upon(case.get("wind_down"), case, "wind_down", lead + " to",
+            wd_src = str(case.get("wind_down") or "")
+            if dep and re.search(r"appropriat\w+\s+of\s+the\s+security\s+deposit", wd_src, re.I):
+                # already stated as its own paragraph above
+                wd_src = "\n".join(l for l in wd_src.split("\n")
+                                   if not re.search(r"appropriat\w+\s+of\s+the\s+security", l, re.I)) \
+                    if "\n" in wd_src else wd_src
+                items_ = [i for i in C.as_items(wd_src)
+                          if not re.search(r"appropriat\w+\s+of\s+the\s+security", i, re.I)]
+                wd_src = "\n".join(items_)
+            wlead, wsubs = C.fit_called_upon(wd_src, case, "wind_down", lead + " to",
                                              lead_noun="Upon termination, the following shall apply")
             if wsubs:
                 li.append((wlead, dict(sub=wsubs)))
@@ -1022,11 +1130,14 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                        + (" " + imp if imp else " The expected impact and duration is "
                           + blank("impact / duration") + "."))
             if qty:
-                # The affected deliveries as a table: the same figures in prose are
-                # far easier for the other side to dispute later.
+                # The affected deliveries as a table. The lead keeps the WHOLE
+                # affected sentence — cutting it at the first full stop left a
+                # headless fragment ("The Company's obligation under Clause 4.1 …").
                 tot = {k: sum(to_float(r.get(k)) or 0 for r in qty) for k in ("sched", "done", "pend")}
-                li.append((C.strip_end(aff_txt.split(". ")[0]) + ", in respect of the following "
-                           "quantities:",
+                lead_sent = C.sentences(aff or "")[0] if aff else ""
+                li.append((C.strip_end(lead_sent or "As a direct consequence, the Company is "
+                                       "prevented or delayed from performing its obligations under "
+                                       "the Agreement") + ", in respect of the following quantities:",
                            dict(head=["Month / period", "Scheduled", "Delivered", "Pending", "Due date"],
                                 rows=[[r.get("period") or blank("month / period"),
                                        r.get("sched") or blank("scheduled quantity"),
@@ -1036,7 +1147,9 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                                       for r in qty]
                                      + [["Total", f"{tot['sched']:g}", f"{tot['done']:g}",
                                          f"{tot['pend']:g}", ""]])))
-                rest = ". ".join(aff_txt.split(". ")[1:]).strip()
+                rest = " ".join(C.sentences(aff or "")[1:]).strip()
+                if imp:
+                    rest = (rest + " " + imp).strip()
                 if rest:
                     li.append(rest)
             else:
@@ -1049,6 +1162,17 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
             else:
                 li.append(mlead or "The Company is taking the following steps to mitigate the effect of "
                                    "the said event: " + blank("mitigation steps") + ".")
+            # In time? Force majeure claims are lost on late notice more often
+            # than on the merits, so the notice says when the event began.
+            fmd_ = parse_date(case.get("fm_date"))
+            nd_ = parse_date(case.get("notice_date"))
+            if fmd_ and nd_ and nd_ >= fmd_:
+                li.append(f"This notice is given on {fmt_date(nd_)}, being {(nd_ - fmd_).days} day(s) "
+                          f"from the commencement of the said event on {fmt_date(fmd_)}, in "
+                          f"accordance with Clause {cl}.")
+            cont = C.fit_inline(C.contract_text(str(case.get("fm_continue") or "")))
+            if cont:
+                li.append(C.cap_first(C.end_stop(cont)))
             rlead, rsubs = C.fit_relief(case.get("relief"), case, cl)
             keep = " The Company will keep you informed and resume performance as soon as reasonably " \
                    "practicable."
@@ -1102,6 +1226,17 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
     prior = _prior_para(kind, case, note) if kind in ("s138", "recovery", "breach", "termination") else ""
     blocks = list(head)
     blocks.append(Block("subject", text="Sub: " + _final(subject), bold=True))
+    # What the notice is given under — the skill's versions carry this line and
+    # it saves the reader hunting for the agreement and clause.
+    if kind in ("breach", "termination", "renewal", "fm", "price"):
+        agr_ = str(case.get("agreement_name") or "").strip()
+        dt_ = fmt_date(case.get("agreement_date"))
+        cl_ = str(case.get("clause_no") or "").strip()
+        if agr_:
+            ref_ = f"Ref: {agr_}" + (f" dated {dt_}" if dt_ else "")
+            if cl_:
+                ref_ += f" — Clause {cl_}"
+            blocks.append(Block("subject", text=_final(ref_ + "."), bold=True))
     blocks.append(Block("p", text="Dear Sir/Madam," if kind == "consumer" else "Sir/Madam,"))
     if opening:
         blocks.append(Block("p", text=_final(opening)))

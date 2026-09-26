@@ -145,7 +145,8 @@ def _rows_from_lines(raw: str, cols: list[str]) -> list[dict]:
         if len(parts) < 2:
             continue
         row = {c: "" for c in cols}
-        text_cols = [c for c in cols if c in ("ref", "no", "sku", "desc", "size", "bank", "period")]
+        text_cols = [c for c in cols if c in ("ref", "no", "sku", "desc", "size", "bank", "period",
+                                              "finding", "remark", "detail")]
         date_cols = [c for c in cols if c in ("date", "due")]
         for p in parts:
             d = parse_date(p)
@@ -181,6 +182,25 @@ def _parse(kind: str, qid: str, raw: str, case: dict) -> dict:
         return {}
     v: dict = {}
     low = t.lower()
+
+    if qid in ("addr", "who"):
+        em = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", t)
+        if em:
+            v["email"] = em.group(0).rstrip(".,;")
+            # drop the whole "Email: x@y" phrase, not just the address
+            t = re.sub(r"(?:e-?mail|mail id)?\s*[:\-]?\s*" + re.escape(em.group(0)),
+                       " ", t, flags=re.I)
+        rf = re.search(r"(?:ref(?:erence)?)\.?\s*(?:no\.?)?\s*[:#-]?\s*"
+                       r"([A-Za-z0-9&][A-Za-z0-9&/\-_.]*\d[A-Za-z0-9&/\-_.]*)", t, re.I)
+        if rf and qid == "who":
+            v["notice_ref"] = rf.group(1).rstrip(".,;")
+
+    if qid == "deposit" and kind == "termination":
+        am = find_amounts(t)
+        if am:
+            v["deposit_held"] = str(max(am))
+        if re.search(r"on\s+receipt|upon\s+receipt|with\s+immediate\s+effect", t, re.I):
+            v["effect_on_receipt"] = "Yes"
 
     if qid == "addr":
         # "Kind Attn.: Mr Rahul Sawant, Director – Operations" is a contact line,
@@ -416,6 +436,12 @@ def _parse(kind: str, qid: str, raw: str, case: dict) -> dict:
             re.search(r"\bClauses?\s+([\d.]+(?:\([a-z0-9]+\))?)", t, re.I)
         if m:
             v["obligation_clause"] = m.group(1).rstrip(".")
+
+    elif qid == "sched":
+        rows_ = _rows_from_lines(t, ["ref", "date", "amt", "finding"])
+        keep = [r for r in rows_ if str(r.get("ref", "")).strip()]
+        if keep:
+            v["schedule"] = keep
 
     elif qid == "qty":
         rows_ = _rows_from_lines(t, ["period", "sched", "done", "pend", "due"])

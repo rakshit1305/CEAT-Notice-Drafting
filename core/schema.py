@@ -61,7 +61,10 @@ LABELS = {
     "blk_c": "Block C — no privity",
     "agreement_name": "Agreement title", "agreement_date": "Agreement date",
     "clause_no": "Clause", "obligation_clause": "Clause containing the obligation",
-    "attn_name": "Kind attention", "attn_desig": "Designation (kind attention)", "obligation": "The obligation", "breach_facts": "Particulars of the breach",
+    "attn_name": "Kind attention", "attn_desig": "Designation (kind attention)",
+    "email": "Email address", "notice_ref": "Their notice reference",
+    "deposit_held": "Security deposit held", "effect_on_receipt": "Takes effect on receipt",
+    "fm_continue": "If the event continues", "obligation": "The obligation", "breach_facts": "Particulars of the breach",
     "cure_period": "Cure period", "consequences": "Consequences if not cured",
     "subject_of": "What the agreement governs", "ground": "Ground",
     "facts": "Facts", "cure_given_date": "Cure period given on",
@@ -73,7 +76,8 @@ LABELS = {
     "fm_event": "The event", "fm_date": "Event began on", "affected": "Affected obligations",
     "impact": "Expected impact / duration", "mitigation": "Mitigation steps",
     "relief": "Relief sought", "reason": "Reason for the revision",
-    "prices": "Revised prices", "quantities": "Affected quantities", "pre_orders": "Orders placed before the effective date",
+    "prices": "Revised prices", "quantities": "Affected quantities",
+    "schedule": "Schedule of particulars", "pre_orders": "Orders placed before the effective date",
 }
 
 # What each field MEANS. The model used to receive bare keys such as
@@ -118,6 +122,14 @@ FIELD_HELP = {
     "price_change_pct": "price notice: the overall percentage revision, when no SKU-wise table is given",
     "quantities": "force majeure: the affected deliveries — one row per month/period with scheduled, "
                   "delivered, pending and the due date",
+    "email": "the recipient's email address, if the notice is also being sent by email",
+    "notice_ref": "consumer reply: the reference number printed on the incoming notice",
+    "deposit_held": "termination: the security deposit the Company holds, digits only",
+    "schedule": "the item-by-item particulars behind the breach — one row per claim, invoice or "
+                "transaction, with its reference, date, amount and what was found",
+    "effect_on_receipt": "termination: 'Yes' if termination takes effect on receipt of the notice "
+                         "rather than on a fixed date",
+    "fm_continue": "force majeure: what happens if the event continues beyond a stated period",
     "obligation_clause": "termination: the clause that imposed the obligation breached — usually NOT "
                          "the termination clause, which is clause_no",
     "attn_name": "a contact person the notice is marked for the attention of. NOT a noticee: use this "
@@ -140,6 +152,8 @@ TABLE_COLS = {
                  ("pct", "% change")],
     "quantities": [("period", "Month / period"), ("sched", "Scheduled"), ("done", "Delivered"),
                    ("pend", "Pending"), ("due", "Due date")],
+    "schedule": [("ref", "Reference"), ("date", "Date"), ("amt", "Amount (INR)"),
+                 ("finding", "Finding / remark")],
     "directors":[("name", "Director / partner name"), ("address", "Address")],
     "paras":    [("n", "Para"), ("stance", "Stance"), ("text", "Response")],
     "demands":  [("d", "Demand"), ("resp", "Response"), ("note", "Note")],
@@ -190,7 +204,7 @@ _PARTY = [
                ("Company + directors", "Company + directors", "Joint & several liability"),
                ("Partnership + partners", "Partnership firm + partners", "Joint & several liability")]),
     Q("addr", "Who is it addressed to — full name(s) and address?",
-      ["noticee_name", "noticee_address", "attn_name", "attn_desig"], attach=True,
+      ["noticee_name", "noticee_address", "attn_name", "attn_desig", "email"], attach=True,
       hint="For a sole proprietorship, give the proprietor's own name as well as the firm — a "
            "proprietorship is not a separate legal person.",
       ph="e.g. M/s Sharma Tyres, Prop. Mr. Rakesh Sharma, Shop 14, MG Road, Jaipur – 302001. "
@@ -263,8 +277,8 @@ QUESTIONS: dict[str, list[Q]] = {
           attach=True, rows=8,
           hint="The reply is built against this text paragraph by paragraph.",
           ph="Paste the complete notice — every numbered paragraph"),
-        Q("who", "Who sent it, and when? Advocate's name, address, and the date on the notice.",
-          ["advocate_name", "advocate_address", "notice_date"], attach=True,
+        Q("who", "Who sent it, and when? Advocate's name, address, the date and any reference number.",
+          ["advocate_name", "advocate_address", "notice_date", "notice_ref", "email"], attach=True,
           ph="e.g. Adv. S. Krishnan, 22 Law Chambers, Chennai – 600104. Notice dated 04.08.2026."),
         Q("client", "Who is their client, and what did they buy — from whom?",
           ["client_name", "client_relation", "client_address", "product", "dealer"],
@@ -319,6 +333,15 @@ QUESTIONS: dict[str, list[Q]] = {
           ph="e.g. under Clause 7.2, required to clear dues within 30 days; cure notice 02.06.2026, "
              "lapsed 17.06.2026, still unpaid"),
         Q("eff", "Effective from what date?", ["effective_date"], kind="date"),
+        Q("sched", "The particulars, item by item, if you have them", ["schedule"], attach=True,
+          hint="One line per claim or invoice: reference | date | amount | what was found. These "
+               "are the evidence for the notice and are annexed as a Schedule.",
+          ph="CLM/2026/0412 | 14.02.2026 | 12,300 | serial number buffed and re-embossed"),
+        Q("deposit", "Do you hold a security deposit, and does termination take effect on receipt?",
+          ["deposit_held", "effect_on_receipt"],
+          hint="Most agreements make termination effective when the notice is received, not on a "
+               "date you choose.",
+          ph="e.g. security deposit of INR 1,00,000 held; termination to take effect on receipt"),
         Q("wind", "What must they do on the way out — dues, stock, signage?", ["wind_down", "dues"],
           ph="e.g. clear dues of INR 3,20,000, return Company property and stock, cease use of CEAT marks"),
         _PRIOR] + _SEND,
@@ -347,6 +370,11 @@ QUESTIONS: dict[str, list[Q]] = {
           hint="One line per month or delivery: period | scheduled | delivered | pending | due "
                "date. A table is far harder to dispute later than the same figures in a sentence.",
           ph="September 2026 | 400 | 160 | 240 | 25.09.2026"),
+        Q("cont", "What happens if the event continues?", ["fm_continue"],
+          hint="Most force majeure clauses let either side terminate or renegotiate if the event "
+               "runs beyond a stated period.",
+          ph="e.g. if it continues beyond 60 days, either party may terminate on 15 days' notice "
+             "under Clause 14.4"),
         Q("relief", "What are you asking them to do?", ["relief"],
           ph="e.g. extend the delivery timelines accordingly"),
     ] + _SEND,

@@ -99,16 +99,16 @@ def money_full(t: str, words: bool = True) -> str:
         return s_ + (f" ({to_words(v)})" if words else "")
 
     def bare(m):
-        lead, cur, num = m.group(1), m.group(2), m.group(3)
+        lead, sep, cur, num = m.group(1), m.group(2), m.group(3), m.group(4)
         v = to_float(num)
         if v is None or v < 1000:
             return m.group(0)
         # "for 2026" is a year, not an amount — unless it was written as money
         if not cur and float(v).is_integer() and 1900 <= v <= 2100 and "," not in num:
             return m.group(0)
-        return f"{lead} {rupees(v)}"
+        return f"{lead}{sep} {rupees(v)}"
 
-    out = re.sub(r"\b(" + _MONEY_LEAD + r")\s+(INR\s*|Rs\.?\s*|\u20b9\s*)?"
+    out = re.sub(r"\b(" + _MONEY_LEAD + r")([:\u2014-]?)\s+(INR\s*|Rs\.?\s*|\u20b9\s*)?"
                  r"(\d{4,}(?:\.\d{1,2})?|\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?)(?:/-)?"
                  r"(?!\s*" + _UNIT_AFTER + r")(?!\d)(?![.,/]\d)(?!/)(?!\s*\(Rupees)",
                  bare, t, flags=re.I)
@@ -121,9 +121,18 @@ def money_full(t: str, words: bool = True) -> str:
     return out
 
 
+_ISO_RX = re.compile(r"(?<![\d/])(\d{4})-(\d{2})-(\d{2})(?![\d/])")
+
+
+def house_dates(t: str) -> str:
+    """"to be paid by 2026-12-31" -> "to be paid by 31.12.2026". A stored date
+    that reaches free text must still print in the house format."""
+    return _ISO_RX.sub(lambda m: f"{m.group(3)}.{m.group(2)}.{m.group(1)}", t)
+
+
 def contract_text(t: str) -> str:
     """House treatment for the free text in the contract notices."""
-    return money_full(house_self(house_you(t)[0]))
+    return house_dates(money_full(house_self(house_you(t)[0])))
 
 
 def clean(raw) -> str:
@@ -870,12 +879,35 @@ def _is_item(line: str) -> bool:
     return bool(_AMT_RX.search(line) and (_REF_RX.search(line) or _CODE_RX.match(line)))
 
 
+def money_sentence_items(text: str) -> list[str]:
+    """Three invoices inside one sentence, separated by semicolons or full
+    stops, are still a list. "Invoice No. X dated D for INR A…; Invoice No. Y…"
+    printed as prose because the splitter only looked at line breaks."""
+    t = str(text or "").strip()
+    if "\n" in t:
+        return []
+    chunks = []
+    for part in re.split(r";\s*", t):
+        # sentences() knows "Invoice No." is not a sentence end
+        chunks += [c.strip(" ;") for c in sentences(part) if c.strip(" ;")]
+    hits = [c for c in chunks if _AMT_RX.search(c) and _REF_RX.search(c)]
+    return hits if len(hits) >= 2 else []
+
+
 def layout(text: str) -> dict:
     """Split a block of text into a lead sentence, its list items and any
     closing sentence — and, when the items carry amounts, a table."""
     lines = [l.strip() for l in str(text or "").split("\n") if l.strip()]
     flags = [_is_item(l) for l in lines]
     if sum(flags) < 2:
+        # the items may be inside one sentence rather than on their own lines
+        inline = money_sentence_items(" ".join(lines))
+        if inline:
+            whole = " ".join(lines)
+            first = whole.find(inline[0])
+            last = whole.find(inline[-1]) + len(inline[-1])
+            return dict(lead=whole[:first].strip(" ;,"), items=inline,
+                        tail=whole[last:].strip(" ;,"), table=money_table(inline))
         return dict(lead=" ".join(lines), items=[], tail="", table=None)
     first, last = flags.index(True), len(flags) - 1 - flags[::-1].index(True)
     items = [BULLET.sub("", l).strip() for l in lines[first:last + 1] if l.strip()]
@@ -897,14 +929,19 @@ def money_table(items: list[str]) -> dict | None:
         if not ref_m:
             return None
         ds = find_dates(it)
+        due = ""
+        dm = re.search(r"(?:due|fell due|payable)\s+(?:on\s+)?([\d./-]{6,12})", it, re.I)
+        if dm and find_dates(dm.group(1)):
+            due = ".".join(reversed(find_dates(dm.group(1))[0].split("-")))
         rows.append([ref_m.group(1).rstrip(".,;"),
                      ".".join(reversed(ds[0].split("-"))) if ds else "\u2014",
+                     due or "\u2014",
                      fmt_amount(val) if val is not None else "\u2014"])
         total += val or 0
     if len(rows) < 2:
         return None
-    rows.append(["Total", "", fmt_amount(total)])
-    return dict(head=["Invoice / reference", "Date", "Amount (INR)"], rows=rows)
+    rows.append(["Total", "", "", fmt_amount(total)])
+    return dict(head=["Invoice / reference", "Date", "Due date", "Amount (INR)"], rows=rows)
 
 # --------------------------------------------------------------------------
 # long prose -> paragraphs and points

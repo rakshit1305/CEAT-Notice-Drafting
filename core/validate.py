@@ -15,7 +15,13 @@ from . import draft as DRAFT
 from . import skill_loader as SK
 from .config import MAX_DOC_CHARS, MAX_SHEET_ROWS
 from .schema import CRITICAL, TABLE_COLS, effective, is_filled, label, part_paid, rows
-from .words import fmt_amount, fmt_date, parse_date, to_float, to_words, words_key
+from .words import (find_dates as parse_dates_raw, fmt_amount, fmt_date, parse_date, to_float,
+                    to_words, words_key)
+
+
+def parse_dates_in(text: str) -> list:
+    """Every date in a piece of free text, as date objects."""
+    return [parse_date(d) for d in parse_dates_raw(str(text or ""))]
 
 
 @dataclass
@@ -512,8 +518,20 @@ def validate(kind: str, case: dict, docs=None) -> Report:
     if kind == "price":
         eff = parse_date(case.get("effective_date"))
         if eff and nd0 and eff <= nd0:
-            add_flag("crit", "The revised prices take effect on or before the notice date. A price "
-                             "revision normally needs notice before it applies — check the clause.")
+            r.blockers.append(
+                f"The revised prices are stated to take effect on {fmt_date(eff)}, on or before the "
+                f"date of this notice ({fmt_date(nd0)}). A price revision applies only after notice "
+                "— set the effective date, or change the notice date.")
+        # The cut-off named in the pre-orders answer IS the effective date. A
+        # notice that says "effective 25.09.2026" and then "orders accepted
+        # before 01.11.2026 keep the old price" contradicts itself.
+        cut = re.search(r"(?:before|prior to|until|up ?to|on or before)\s+([\d./-]{6,12})",
+                        str(case.get("pre_orders") or ""), re.I)
+        cut_d = parse_date(cut.group(1)) if cut else None
+        if eff and cut_d and cut_d != eff:
+            add_flag("crit", f"The notice takes effect on {fmt_date(eff)}, but the answer about "
+                             f"orders already placed uses {fmt_date(cut_d)} as the cut-off. One of "
+                             "the two is wrong.")
         elif eff and nd0 and (eff - nd0).days < 30:
             add_flag("warn", f"Only {(eff - nd0).days} day(s) between this notice and the effective "
                              "date. ⚠ VERIFY the notice period the price-variation clause requires.")
@@ -525,6 +543,20 @@ def validate(kind: str, case: dict, docs=None) -> Report:
             "Revised prices stated, with old versus new or the percentage.")
         chk("pass" if str(case.get("pre_orders") or "").strip() else "fail",
             "Treatment of orders already placed is addressed.")
+
+    if kind in ("breach", "termination"):
+        # clauses named in the facts but not in the citation, and the reverse
+        said_cl = set(re.findall(r"clauses?\s+(\d+(?:\.\d+)*(?:\([a-z0-9]+\))?)",
+                                 " ".join(str(case.get(k) or "") for k in
+                                          ("obligation", "facts", "breach_facts", "consequences")),
+                                 re.I))
+        given = set(re.findall(r"\d+(?:\.\d+)*(?:\([a-z0-9]+\))?",
+                               str(case.get("obligation_clause") or case.get("clause_no") or "")))
+        extra = sorted(said_cl - given)
+        if extra and given:
+            add_flag("crit", f"The facts rely on Clause(s) {', '.join(extra)}, but the notice cites "
+                             f"Clause(s) {', '.join(sorted(given))} as the obligation. A notice that "
+                             "cites one clause and proves another is easy to answer — make them agree.")
 
     if kind == "breach":
         cited = re.findall(r"\d+(?:\.\d+)*[a-z]?", str(case.get("clause_no") or ""))
