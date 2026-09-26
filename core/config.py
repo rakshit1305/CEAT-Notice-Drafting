@@ -39,7 +39,19 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # off GitHub. Point it at a OneDrive / SharePoint / Google Drive sync folder
 # or a shared network drive and the notices land there directly.
 SAVE_DIR = Path(_secret("NOTICE_SAVE_DIR", str(OUTPUT_DIR))).expanduser()
-AUTO_SAVE = _secret("NOTICE_AUTO_SAVE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+# Saving is OFF unless someone turns it on. It used to default ON, which on a
+# public URL with no login meant every drafted notice — real party names,
+# cheque numbers, amounts — sat in one shared folder that the Saved notices tab
+# showed to any visitor. Notices are personal data; keeping them is a decision
+# the deployment makes deliberately, not a default.
+SAVE_NOTICES = _secret("NOTICE_SAVE", "0").strip().lower() in ("1", "true", "yes", "on")
+AUTO_SAVE = SAVE_NOTICES and _secret("NOTICE_AUTO_SAVE", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+
+# A shared password for the whole app. Set it whenever the app is reachable from
+# the internet: Streamlit Community Cloud has no accounts of its own.
+APP_PASSWORD = _secret("APP_PASSWORD", "").strip()
 
 # --- provider -------------------------------------------------------------
 # Groq is OpenAI-compatible, so the same client speaks to either.

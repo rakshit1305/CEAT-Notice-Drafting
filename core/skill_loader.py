@@ -107,6 +107,8 @@ def letterhead() -> dict:
     if not m:
         return dict(name="CEAT Limited", address="", meta="")
     lines = [l.strip() for l in m.group(1).splitlines() if l.strip()]
+    if not lines:                     # an empty code fence used to crash the preview
+        return dict(name="CEAT Limited", address="", meta="")
     name = lines[0]
     meta = next((l for l in lines if "CIN" in l), "")
     www = next((l for l in lines if l.lower().startswith("www")), "")

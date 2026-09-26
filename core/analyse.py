@@ -357,7 +357,9 @@ def deterministic(kind: str, case: dict, docs: list[Doc]) -> Found:
     for d in docs:
         if d.kind == "tables":
             for t in d.tables:
-                rows = t["rows"]
+                rows = [r for r in (t.get("rows") or []) if r]
+                if not rows:
+                    continue          # an empty sheet used to raise IndexError here
                 hi = _header_row(rows)
                 header = [str(c).strip() for c in rows[hi]]
                 body = [r for r in rows[hi + 1:] if any(str(c).strip() for c in r)]
@@ -666,7 +668,9 @@ def _filter_from_docs(docs, party: str, key: str):
         if getattr(d, "kind", "") != "tables":
             continue
         for t in getattr(d, "tables", []) or []:
-            rows_ = t["rows"]
+            rows_ = [r for r in (t.get("rows") or []) if r]
+            if not rows_:
+                continue
             hi = _header_row(rows_)
             header = [str(c).strip() for c in rows_[hi]]
             body = [r for r in rows_[hi + 1:] if any(str(c).strip() for c in r)]

@@ -485,8 +485,13 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
         if many:
             li.append((f"That {disc} of your admitted liability you issued the following cheques:",
                        dict(head=["Cheque No.", "Cheque Date", "Amount (INR)", "Drawn on"],
-                            rows=[[c.get("no", "—"), fmt_date(c.get("date")) or "—",
-                                   fmt_amount(c.get("amt")) or "—", c.get("bank", "—")] for c in chq])))
+                            # Never an em dash here: a missing cheque date or bank
+                            # printed as "—" was invisible to the blank check, and
+                            # the notice downloaded as ready to issue without it.
+                            rows=[[c.get("no") or blank("cheque no."),
+                                   fmt_date(c.get("date")) or blank("cheque date"),
+                                   fmt_amount(c.get("amt")) or blank("cheque amount"),
+                                   c.get("bank") or blank("drawn-on bank")] for c in chq])))
         else:
             c = chq[0] if chq else {}
             amt_w = to_words(c.get("amt")) if to_float(c.get("amt")) else ""
@@ -504,7 +509,7 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                        + (f" on {pres}" if pres else "")
                        + " and, to our shock, were returned unpaid by the drawee bank, as follows:",
                        dict(head=["Cheque No.", "Returned unpaid on", "Reason", "Bank memo dated"],
-                            rows=[[n_ or "—", fmt_date(d) or blank("date of dishonour"),
+                            rows=[[n_ or blank("cheque no."), fmt_date(d) or blank("date of dishonour"),
                                    f"“{r}”" if r else blank("reason on memo"),
                                    fmt_date(m) or blank("bank memo date")] for n_, d, r, m in facts])))
         else:
@@ -624,8 +629,10 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
         if soa:
             total = sum(to_float(r.get("amt")) or 0 for r in soa)
             li.append((p7, dict(head=["SR No.", "Invoice / Reference", "Document Date", "Outstanding (INR)"],
-                                rows=[[str(i), r.get("ref", "—"), fmt_date(r.get("date")) or "—",
-                                       fmt_amount(r.get("amt")) or "—"] for i, r in enumerate(soa, 1)]
+                                rows=[[str(i), r.get("ref") or blank("invoice / reference"),
+                                       fmt_date(r.get("date")) or blank("document date"),
+                                       fmt_amount(r.get("amt")) or blank("outstanding amount")]
+                                      for i, r in enumerate(soa, 1)]
                                      + [["", "Total", "", fmt_amount(total)]])))
         else:
             li.append(re.sub(r"\s*The Statement of Account is as follows:\s*$", "", p7))
@@ -1021,8 +1028,11 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                 li.append((C.strip_end(aff_txt.split(". ")[0]) + ", in respect of the following "
                            "quantities:",
                            dict(head=["Month / period", "Scheduled", "Delivered", "Pending", "Due date"],
-                                rows=[[r.get("period", "—"), r.get("sched") or "—", r.get("done") or "—",
-                                       r.get("pend") or "—", fmt_date(r.get("due")) or r.get("due") or "—"]
+                                rows=[[r.get("period") or blank("month / period"),
+                                       r.get("sched") or blank("scheduled quantity"),
+                                       r.get("done") or "Nil",
+                                       r.get("pend") or blank("pending quantity"),
+                                       fmt_date(r.get("due")) or r.get("due") or blank("due date")]
                                       for r in qty]
                                      + [["Total", f"{tot['sched']:g}", f"{tot['done']:g}",
                                          f"{tot['pend']:g}", ""]])))
@@ -1068,8 +1078,9 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                 li.append(("The revised prices are as follows:",
                            dict(head=["Product / SKU", "Existing price (INR)", "Revised price (INR)",
                                       "% change"],
-                                rows=[[r.get("sku"), fmt_amount(r.get("old")) or "—",
-                                       fmt_amount(r.get("nw")) or "—",
+                                rows=[[r.get("sku") or blank("product / SKU"),
+                                       fmt_amount(r.get("old")) or blank("existing price"),
+                                       fmt_amount(r.get("nw")) or blank("revised price"),
                                        _pct(r)] for r in prows])))
             elif pct:
                 li.append(f"The revision is a uniform {pct}% across the products supplied under the said "
@@ -1163,9 +1174,39 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
     return subject, blocks
 
 
+def block_blanks(blocks: list[Block]) -> list[str]:
+    """Every [● …] in the document, read from the blocks themselves.
+
+    Reading the rendered text instead meant that anything which failed to
+    render — a table block, a cell — took its missing-field markers with it,
+    and the download unlocked on a notice that was missing a cheque date.
+    """
+    found: list[str] = []
+
+    def scan(value):
+        if value is None:
+            return
+        if isinstance(value, (list, tuple)):
+            for v in value:
+                scan(v)
+        elif isinstance(value, dict):
+            for v in value.values():
+                scan(v)
+        else:
+            found.extend(C.blanks(str(value)))
+
+    for b in blocks:
+        scan(b.text)
+        scan(b.items)
+        scan(b.head)
+        scan(b.rows)
+    return found
+
+
 def blanks(kind: str, case: dict) -> list[str]:
     """Every [● …] still in the notice. None may reach an issued .docx."""
-    return C.blanks(to_text(kind, case))
+    _, blocks = build(kind, case)
+    return block_blanks(blocks)
 
 
 # --------------------------------------------------------------------------
@@ -1192,6 +1233,11 @@ def to_text(kind: str, case: dict) -> str:
         elif b.kind == "list":
             for j, it in enumerate(b.items):
                 out.append(f"   ({chr(97 + j)}) {it}")
+            out.append("")
+        elif b.kind == "table":
+            out.append("   " + " | ".join(b.head))
+            for r in b.rows:
+                out.append("   " + " | ".join(str(c) for c in r))
             out.append("")
         else:
             out.append(b.text)
@@ -1221,6 +1267,20 @@ def to_docx(kind: str, case: dict, specimen: bool = False) -> bytes:
     style.font.name = "Georgia"
     style.font.size = Pt(11)
     style.element.rPr.rFonts.set(qn("w:eastAsia"), "Georgia")
+
+    def _grid(doc_, head, rows_):
+        t = doc_.add_table(rows=1, cols=len(head))
+        t.style = "Table Grid"
+        for c, h in zip(t.rows[0].cells, head):
+            run = c.paragraphs[0].add_run(str(h))
+            run.bold = True
+            run.font.size = Pt(9)
+        for row in rows_:
+            cells = t.add_row().cells
+            for c, v in zip(cells, row):
+                r = c.paragraphs[0].add_run(str(v))
+                r.font.size = Pt(9)
+        doc_.add_paragraph().paragraph_format.space_after = Pt(4)
 
     def para(text, *, size=11, bold=False, underline=False, align=None,
              space_after=8, pre=False):
@@ -1275,18 +1335,9 @@ def to_docx(kind: str, case: dict, specimen: bool = False) -> bytes:
                         sp.paragraph_format.line_spacing = 1.35
                         sp.add_run(f"({chr(97 + j)})\t{sub}")
                 elif tbl:
-                    t = doc.add_table(rows=1, cols=len(tbl["head"]))
-                    t.style = "Table Grid"
-                    for c, h in zip(t.rows[0].cells, tbl["head"]):
-                        run = c.paragraphs[0].add_run(str(h))
-                        run.bold = True
-                        run.font.size = Pt(9)
-                    for row in tbl["rows"]:
-                        cells = t.add_row().cells
-                        for c, v in zip(cells, row):
-                            r = c.paragraphs[0].add_run(str(v))
-                            r.font.size = Pt(9)
-                    doc.add_paragraph().paragraph_format.space_after = Pt(4)
+                    _grid(doc, tbl["head"], tbl["rows"])
+        elif b.kind == "table":
+            _grid(doc, b.head, b.rows)
         elif b.kind == "list":
             for j, it in enumerate(b.items):
                 lp = doc.add_paragraph()

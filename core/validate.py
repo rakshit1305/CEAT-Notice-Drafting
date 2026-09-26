@@ -77,6 +77,16 @@ def missing_optional(kind: str, case: dict) -> list[str]:
 
 def validate(kind: str, case: dict, docs=None) -> Report:
     r = Report()
+    # The notice as it will print, built once. Checklist items are asserted
+    # against THIS, not written as literal passes: four of them used to show
+    # green whether or not the notice said what they claimed.
+    draft_text, draft_blocks, draft_notes = "", [], []
+    try:
+        _, draft_blocks = DRAFT.build(kind, case, draft_notes)
+        draft_text = DRAFT.to_text(kind, case)
+    except Exception:
+        pass
+    said = (draft_text or "").lower()
     case = effective(kind, case)          # a fact on every cheque row counts as known
     ref = SK.notice_ref(kind)
     add_flag = lambda sev, t: r.flags.append((sev, t))
@@ -246,8 +256,10 @@ def validate(kind: str, case: dict, docs=None) -> Report:
             add_flag("info", f"This notice covers {len(chq)} cheques. Each is a separate cause of action "
                              "with its own limitation clock; confirm with the lawyer that one composite "
                              "notice is the intended course rather than separate notices.")
-        chk("pass", "Subject cites Section 138 r/w Section 141, NI Act, 1881.")
-        chk("pass", "Demand gives 15 (FIFTEEN) days from receipt.")
+        chk("pass" if "section 138" in said and "section 141" in said else "fail",
+            "Subject cites Section 138 r/w Section 141, NI Act, 1881.")
+        chk("pass" if re.search(r"15 \(fifteen\) days from the date of receipt", said) else "fail",
+            "Demand gives 15 (FIFTEEN) days from receipt.")
         chk("pass" if case.get("noticee_type", "").startswith(("Company","Partnership"))
             and rows(case, "directors") else
             ("na" if not case.get("noticee_type", "").startswith(("Company","Partnership")) else "fail"),
@@ -267,7 +279,9 @@ def validate(kind: str, case: dict, docs=None) -> Report:
         chk("pass" if abs(soa_total - (amt or 0)) < 0.5 and soa_total else "na",
             "Statement of account total ties to the demanded amount.")
         chk("pass" if case.get("interest") else "fail", "Interest rate stated (CEAT default 8% p.a.).")
-        chk("pass", "Demand gives 10 days from receipt; civil and criminal language present.")
+        chk("pass" if (re.search(r"10 days from the date of receipt", said)
+                       and "civil as well as criminal" in said) else "fail",
+            "Demand gives 10 days from receipt; civil and criminal language present.")
 
         # Invoices not yet due on the notice date. The notice itself says payment
         # was due 30 days from invoice, so demanding a later invoice as unpaid is
@@ -529,7 +543,8 @@ def validate(kind: str, case: dict, docs=None) -> Report:
             r.blockers.append(f"The amount in words does not match the figure. INR {fmt_amount(amt)} reads "
                               f"as “{to_words(amt)}”, but the notice would say “{case['amount_words']}”.")
 
-    chk("pass", "Every output carries the review banner and is a draft for legal review.")
+    chk("pass" if str(SK.review_banner() or "").strip() else "fail",
+        "Every output carries the review banner and is a draft for legal review.")
 
     # ---- 6. annexures -----------------------------------------------------
     r.annexures = {
@@ -604,9 +619,10 @@ def validate(kind: str, case: dict, docs=None) -> Report:
     # broken sentences, a leftover [● inspection finding] and duplicated
     # paragraphs reached signed notices.
     try:
-        draft_notes: list = []
-        DRAFT.build(kind, case, draft_notes)
-        text = DRAFT.to_text(kind, case)
+        blocks, text = draft_blocks, draft_text
+        if not blocks:
+            _, blocks = DRAFT.build(kind, case, draft_notes)
+            text = DRAFT.to_text(kind, case)
         for n in draft_notes:
             add_flag("crit" if n.startswith("Template drift") else "warn", n)
         for l in C.lint(text):
@@ -615,7 +631,9 @@ def validate(kind: str, case: dict, docs=None) -> Report:
                      text, re.I):
             add_flag("info", "Some amounts appear without ‘Rs.’/‘INR’ or Indian grouping (e.g. “32000”). "
                              "Write them as “Rs. 32,000/-” in the answers.")
-        r.blanks = C.blanks(text)
+        # read from the document structure: a marker inside a table used to be
+        # invisible here, and the notice unlocked as ready to issue
+        r.blanks = DRAFT.block_blanks(blocks)
         if r.blanks:
             add_flag("crit", f"{len(r.blanks)} detail(s) are still blank in the notice: "
                              + "; ".join(r.blanks[:8]) + ". A notice with blanks cannot be downloaded as "

@@ -5,6 +5,7 @@ and grouping in the Indian system (lakh, crore).
 """
 from __future__ import annotations
 import re
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime
 
 ONES = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
@@ -30,8 +31,15 @@ def to_words(value) -> str:
     n = to_float(value)
     if n is None:
         return ""
-    whole = int(n)
-    paise = int(round((n - whole) * 100))
+    # Round to paise FIRST. Taking int(n) and then rounding the remainder gave
+    # paise = 100 for any amount at or above x.995 — _u100(100) then raised
+    # IndexError and killed the notice. Money is rounded up to the rupee here,
+    # exactly as fmt_amount does, so figures and words can never disagree.
+    neg = n < 0
+    cents = int(Decimal(str(abs(n))).quantize(Decimal("1"), rounding=ROUND_HALF_UP)) \
+        if abs(n) >= 1e15 else int(Decimal(str(abs(n))).scaleb(2).quantize(Decimal("1"),
+                                                                          rounding=ROUND_HALF_UP))
+    whole, paise = divmod(cents, 100)
     if whole == 0 and paise == 0:
         return ""
     parts: list[str] = []
@@ -46,7 +54,8 @@ def to_words(value) -> str:
         parts.append(_u1000(thou) + " Thousand")
     if whole:
         parts.append(_u1000(whole))
-    s = "Rupees " + " ".join(p for p in parts if p).strip()
+    body = " ".join(p for p in parts if p).strip() or "Zero"
+    s = "Rupees " + ("Minus " if neg else "") + body
     if paise:
         s += " and Paise " + _u100(paise)
     return s + " Only"
@@ -106,9 +115,11 @@ def fmt_amount(value) -> str:
     if n is None:
         return ""
     neg = n < 0
-    n = abs(n)
-    whole = int(n)
-    dec = f"{n - whole:.2f}"[2:]
+    # Round to paise before splitting: int(1000.996) dropped the rupee entirely
+    # and printed 1,000 where the words said One Thousand and One.
+    cents = int(Decimal(str(abs(n))).scaleb(2).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    whole, p_ = divmod(cents, 100)
+    dec = f"{p_:02d}"
     s = str(whole)
     if len(s) > 3:
         head, tail = s[:-3], s[-3:]
