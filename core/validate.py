@@ -442,6 +442,15 @@ def validate(kind: str, case: dict, docs=None) -> Report:
                              "run the effect from receipt — confirm the clause allows same-day effect.")
         add_flag("warn", "⚠ VERIFY the termination clause, the required notice period and any cure "
                          "requirement against the signed agreement.")
+        # "governing termination of the Agreement for fraudulent claims" describes
+        # this notice, not what the agreement covers.
+        sub_ = str(case.get("subject_of") or "").strip()
+        if sub_ and re.search(r"^\s*(?:termination|notice|breach|cancellation|recovery)\b|"
+                              r"\bfor (?:submission of|submitting|false|fraudulent)\b", sub_, re.I):
+            add_flag("crit", "“What the agreement governs” reads like the purpose of this notice "
+                             f"(“{sub_[:60]}…”). It should describe the arrangement itself — the "
+                             "appointment, the territory, the dealer code, what the dealer did.")
+
         # A fraud/audit-based termination that counts items should annex them.
         fct = str(case.get("facts") or "")
         m_ = re.search(r"\b(\d{2,})\s+(claims?|invoices?|items?|instances?|transactions?|entries)\b",
@@ -461,6 +470,16 @@ def validate(kind: str, case: dict, docs=None) -> Report:
             add_flag("warn", "The breach facts and the wind-down answer overlap heavily, so the notice "
                              "may say the same thing twice. Keep what happened in the facts and what "
                              "they must now do in the wind-down.")
+
+    # Internal approvals belong in the file, not in a notice to the other side.
+    told = " ".join(str(case.get(k) or "") for k in
+                    ("facts", "breach_facts", "detail", "extra_notes", "wind_down"))
+    if re.search(r"internal approval|approval (?:was )?(?:obtained|granted|received)|zonal head|"
+                 r"management approval|legal has cleared|approved by the (?:zonal|regional|national)",
+                 told, re.I):
+        add_flag("crit", "The facts mention an internal approval (who inside CEAT cleared this). "
+                         "That is not the other side's business and should not appear in the notice "
+                         "— take the sentence out of the answer.")
 
     if kind == "fm":
         fmd = parse_date(case.get("fm_date"))
