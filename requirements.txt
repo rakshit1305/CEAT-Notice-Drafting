@@ -1,9 +1,12 @@
 streamlit>=1.48          # container keys -> st-key-* hooks used by the stylesheet
+                         # no upper pin on purpose: core/uikit.py asks the installed
+                         # version which container-width keyword it accepts
 openai>=1.55.3           # <1.55.3 passes proxies= to httpx, which httpx 0.28 removed
 pandas>=2.1
 openpyxl>=3.1           # .xlsx
 xlrd>=2.0               # legacy .xls
 pdfplumber>=0.11        # PDF text + tables
 python-docx>=1.1        # read .docx, write the notice
+olefile>=0.47           # Outlook .msg is a Compound File; pure Python, no build step
 python-dotenv>=1.0
 httpx>=0.27              # pinned together with openai: they must agree

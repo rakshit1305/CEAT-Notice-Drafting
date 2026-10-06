@@ -3,3 +3,17 @@
 __pycache__/
 drafts/
 *.pyc
+
+# Outlook messages and their attachments are evidence in a live matter — a
+# .msg dragged into the folder while testing must never reach GitHub.
+*.msg
+*.eml
+
+# CEAT's letterhead artwork and template DO belong in the repo: that is how
+# skill/assets works. Everything else there is a local scratch file.
+skill/assets/*
+!skill/assets/README.md
+!skill/assets/letterhead.png
+!skill/assets/letterhead.jpg
+!skill/assets/letterhead.docx
+!skill/assets/ceat-letterhead.docx
