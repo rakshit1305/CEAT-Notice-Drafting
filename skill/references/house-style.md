@@ -11,7 +11,19 @@ www.ceat.com
 This letterhead is read from CEAT's own sample notices (the CIN L25100MH1958PLC011041
 appears on them and matches CEAT Limited's public record). Use it exactly. Do NOT add
 any tagline unless it appears on CEAT's official letterhead.
-Reproduce CEAT's actual logo/header image when producing the final .docx if provided.
+
+**When CEAT supplies their artwork**, it replaces the text block above with no code
+change: drop `letterhead.docx` (their Word template — preferred) or `letterhead.png`
+(the header strip) into `skill/assets/`. See `skill/assets/README.md`. The letterhead is
+placed in the first-page header, so a notice running to two pages keeps it; page 2
+onwards carries a slim `CEAT Limited — <subject>` running line and every page is
+numbered `Page n of m`.
+
+Letterhead-width: 16 cm
+
+A line at the foot of every page is optional. To add one, put a `## Page footer` heading
+below with CEAT's standard foot-of-page line inside a fenced block — registered office,
+CIN, contact. With no such heading there is no footer text, only the page number.
 
 ## Standard mode-of-sending line
 `BY SPEED POST` or `THROUGH SPEED POST / EMAIL / WHATSAPP` (as instructed for the case).

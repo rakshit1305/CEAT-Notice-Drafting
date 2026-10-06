@@ -83,3 +83,22 @@ Use in Recovery notices where invoices are tax-inclusive and a breakup was suppl
 > The aforesaid outstanding amount of INR {{AMOUNT_FIGURES}} comprises a principal sum of
 > INR {{PRINCIPAL_AMOUNT}} and applicable GST/tax of INR {{TAX_AMOUNT}}, as reflected in
 > the invoices referred to above.
+
+## Early payment discount
+Use in Recovery, Breach and Termination notices where CEAT has decided to offer a
+discount for early payment. It is a settlement offer made **without prejudice**, not a
+reduction of the debt, and it must not be used in a Section 138 notice: the statutory
+demand there has to be for the cheque amount, and a demand for anything less risks the
+notice itself.
+
+The discounted figure is always **calculated** from the sum demanded — never typed —
+so the two cannot disagree on the page. The offer must lapse on or before the demand
+deadline; an offer that outlives the deadline contradicts the demand it sits next to.
+> Without prejudice to the Company's rights and remedies, and without in any manner
+> admitting or reducing the liability stated above, the Company is willing to accept
+> INR {{DISCOUNT_NET_FIGURES}} ({{DISCOUNT_NET_WORDS}}) in full and final settlement of
+> the aforesaid sum, being a reduction of INR {{DISCOUNT_OFF_FIGURES}}
+> ({{DISCOUNT_PERCENT}}), provided the said amount is received by the Company on or
+> before {{DISCOUNT_BY_DATE}}. If the said amount is not so received, this offer shall
+> stand withdrawn without further intimation and the Company's demand for the full sum
+> of INR {{AMOUNT_FIGURES}}, together with interest, shall stand.
