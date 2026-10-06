@@ -184,6 +184,25 @@ _KIND_RULES = {
     "recovery": (
         "- The amount is the outstanding balance; it must equal the sum of the statement-of-account "
         "rows you return."),
+    "cnd": (
+        "- cnd_right is what CEAT OWNS — the mark, the trade name, the copyright, the confidential "
+        "information, or a surviving post-termination clause. cnd_acts is what the OTHER SIDE is "
+        "doing. Never put the infringement into cnd_right or the right into cnd_acts.\n"
+        "- cnd_acts must carry particulars: what is being done, where, and since when. Do not "
+        "summarise them away into \"infringing the Company's trademarks\" — copy the specifics.\n"
+        "- cnd_stop is the list of acts that must STOP, one per line. An act CEAT wants PERFORMED "
+        "(returning stock, paying dues) does not belong there.\n"
+        "- cnd_first_noticed is the date CEAT became aware, not the date of the infringement.\n"
+        "- A registration number and class belong in cnd_right, exactly as given. Never invent one."),
+    "generic": (
+        "- This is a free-form notice. gen_title is what the notice is called; gen_subject is its "
+        "subject line; gen_facts is the narrative; gen_demand is what CEAT requires, one item per "
+        "line; gen_deadline is the period or date; gen_consequences is what CEAT will do otherwise.\n"
+        "- Keep the facts in gen_facts. Do not move figures into any other field and do not compute "
+        "anything — nothing in this type is checked against a template, so an invented figure would "
+        "go out unchallenged.\n"
+        "- If the documents describe a cheque dishonour, a consumer notice, a termination or an "
+        "infringement, say so in \"missing\": a dedicated type exists for each and should be used."),
 }
 
 

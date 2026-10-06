@@ -12,6 +12,7 @@ import re
 
 from . import compose as C
 from . import draft as DRAFT
+from . import schema as SCHEMA
 from . import skill_loader as SK
 from .config import MAX_DOC_CHARS, MAX_SHEET_ROWS
 from .schema import CRITICAL, TABLE_COLS, effective, is_filled, label, part_paid, rows
@@ -43,6 +44,72 @@ class Report:
     @property
     def ok(self) -> bool:
         return not self.blockers
+
+
+_UNIT = r"(day|days|week|weeks|month|months)"
+# The demand period is the one measured from RECEIPT OF THIS NOTICE. Searching
+# the text for the first "within N days" instead found the 30-day credit term in
+# the recital, so a discount was measured against the invoice terms.
+_DEMAND_RX = re.compile(
+    r"within\s+(?:a\s+period\s+of\s+)?(\d{1,3})\s*(?:\(\s*[A-Za-z]+\s*\)\s*)?" + _UNIT +
+    r"\b[^.]{0,100}?\breceipt\s+of\s+this\s+notice", re.I)
+_DEMAND_WORD_RX = re.compile(
+    r"within\s+([A-Za-z]+)\s+" + _UNIT + r"\b[^.]{0,100}?\breceipt\s+of\s+this\s+notice", re.I)
+_PERIOD_RX = re.compile(
+    r"(?:within\s+)?(?:a\s+period\s+of\s+)?(\d{1,3})\s*(?:\(\s*[A-Za-z]+\s*\)\s*)?" + _UNIT + r"\b",
+    re.I)
+_WORD_PERIOD = {"seven": 7, "ten": 10, "fourteen": 14, "fifteen": 15, "twenty": 20,
+                "thirty": 30, "sixty": 60, "ninety": 90}
+
+
+def _scale(n: int, unit: str):
+    unit = unit.lower()
+    if unit.startswith("week"):
+        n *= 7
+    elif unit.startswith("month"):
+        n *= 30
+    return n if 0 < n <= 365 else None
+
+
+def _blank_near(said: str, phrase: str, window: int = 140) -> bool:
+    """Is the text right after `phrase` a missing-detail marker?
+
+    A phrase being present is not the same as the paragraph saying anything. "the
+    Company shall be constrained to [● the consequences]" contains the phrase and
+    states nothing, and a tick against it would be false.
+    """
+    i = said.find(phrase.lower())
+    if i < 0:
+        return True
+    return "[●" in said[i:i + len(phrase) + window]
+
+
+def _demand_days(kind: str, case: dict, text: str):
+    """How many days the notice itself allows, read out of the drafted text.
+
+    Taken from the notice rather than assumed, so a shortened demand period —
+    which the user is free to set — moves the deadline the discount is checked
+    against instead of leaving the check measuring a period the notice no
+    longer states.
+    """
+    m = _DEMAND_RX.search(text or "")
+    if m:
+        return _scale(int(m.group(1)), m.group(2))
+    m = _DEMAND_WORD_RX.search(text or "")
+    if m and m.group(1).lower() in _WORD_PERIOD:
+        return _scale(_WORD_PERIOD[m.group(1).lower()], m.group(2))
+    # The cure / notice period fields hold nothing but a period, so a plain
+    # search is safe there.
+    for src in (str(case.get("cure_period") or ""), str(case.get("notice_period") or "")):
+        if not src.strip():
+            continue
+        m = _PERIOD_RX.search(src)
+        if m:
+            return _scale(int(m.group(1)), m.group(2))
+        m = re.search(r"([A-Za-z]+)\s+" + _UNIT, src, re.I)
+        if m and m.group(1).lower() in _WORD_PERIOD:
+            return _scale(_WORD_PERIOD[m.group(1).lower()], m.group(2))
+    return None
 
 
 def _sum(rs, key) -> float:
@@ -107,7 +174,7 @@ def validate(kind: str, case: dict, docs=None) -> Report:
 
     # ---- 2. tier ---------------------------------------------------------
     if not ref.approved:
-        add_flag("warn", SK.nonstandard_warning())
+        add_flag("warn", SK.nonstandard_warning(kind))
 
     # ---- 3. standing checks ---------------------------------------------
     if not case.get("authority_confirmed"):
@@ -563,6 +630,109 @@ def validate(kind: str, case: dict, docs=None) -> Report:
         chk("pass" if str(case.get("pre_orders") or "").strip() else "fail",
             "Treatment of orders already placed is addressed.")
 
+    if kind == "cnd":
+        right = str(case.get("cnd_right") or "").strip()
+        acts = str(case.get("cnd_acts") or "").strip()
+        stop = str(case.get("cnd_stop") or "").strip()
+        # Asserted against the drafted notice, not against the answer boxes. A
+        # tick that only means "the field is not empty" passes on a notice whose
+        # template dropped the paragraph — which is how a checklist of green
+        # ticks once sat above a notice missing its demand.
+        chk("pass" if (right and "exclusively entitled to" in said
+                       and not _blank_near(said, "exclusively entitled to")) else "fail",
+            "The right asserted is identified, and the basis on which CEAT holds it.")
+        # "You are infringing our trademarks" asserts nothing a court can act on.
+        # Particulars are what, where and since when.
+        has_where = bool(re.search(r"\b(?:at|in|on|from|near)\b.{3,}", acts)) or bool(
+            re.search(r"https?://|\bwww\.|\bshop\b|\bstore\b|\baddress\b|\bpremises\b", acts, re.I))
+        has_when = bool(parse_dates_in(acts)) or bool(
+            re.search(r"\bsince\b|\bfrom\b|\bafter\b|\b20\d\d\b", acts, re.I))
+        chk("pass" if (len(acts) >= 40 and (has_where or has_when)) else "fail",
+            "The offending acts are particularised — what, where and since when.")
+        if acts and len(acts) < 40:
+            add_flag("crit", "The offending acts are described in one short phrase. A cease and "
+                             "desist stands or falls on particulars: what is being done, where, "
+                             "since when, and how it came to CEAT's notice. As drafted this is an "
+                             "assertion, not evidence of one.")
+        elif acts and not (has_where or has_when):
+            add_flag("warn", "The offending acts name neither a place nor a date. Add where it is "
+                             "happening and since when — the other side's first answer will be to "
+                             "deny it, and the notice should already answer that.")
+        chk("pass" if (stop and "cease and desist from" in said
+                       and not _blank_near(said, "cease and desist from")) else "fail",
+            "Each act that must stop is spelt out, so compliance can be measured.")
+        chk("pass" if ("confirm in writing" in said and "receipt of this notice" in said
+                       and not _blank_near(said, "confirm in writing")) else "fail",
+            "A written undertaking is demanded, within a period running from receipt.")
+        chk("pass" if ("shall be constrained to" in said
+                       and not _blank_near(said, "shall be constrained to")) else "fail",
+            "Consequences of non-compliance are stated.")
+        chk("pass" if "expressly reserved" in said else "fail",
+            "Rights-reserved / without-prejudice line is present.")
+        # A registration asserted with no number is the commonest way one of
+        # these notices gets answered with "prove it".
+        if re.search(r"\bregistered\b|\bregistration\b", right, re.I) and not re.search(
+                r"\b(?:no\.?|number|#)\s*[:\-]?\s*\d{4,}|\b\d{5,}\b", right, re.I):
+            add_flag("warn", "A registered right is asserted but no registration number is given. "
+                             "⚠ VERIFY the number, class and current status against CEAT's records "
+                             "and state them — an unparticularised registration invites a denial.")
+        seen = parse_date(case.get("cnd_first_noticed"))
+        if seen and nd0 and seen > nd0:
+            r.blockers.append(
+                f"The infringement is said to have been noticed on {fmt_date(seen)}, after the date "
+                f"of this notice ({fmt_date(nd0)}). Check the dates.")
+        if seen and nd0 and (nd0 - seen).days > 365:
+            add_flag("warn", f"{(nd0 - seen).days} days have passed since CEAT noticed the "
+                             "infringement. Delay is the standard defence to an injunction — "
+                             "⚠ VERIFY with counsel whether the notice should explain it.")
+        add_flag("info", "Cease and desist: the right asserted, the statute relied on and the "
+                         "relief threatened are matters for counsel. ⚠ VERIFY whether this notice "
+                         "should issue from CEAT or through its advocates — that changes the "
+                         "closing and the signature block.")
+
+    if kind == "generic":
+        # No type-specific wording exists, so the checks are the structural ones
+        # any notice needs. This is a drafting aid for a lawyer and the banner
+        # on the draft says so.
+        subj_ok = bool(re.search(r"(?m)^sub:\s*\S", draft_text or "", re.I)) and \
+            not re.search(r"(?mi)^sub:.*\[●", draft_text or "")
+        chk("pass" if subj_ok else "fail", "A subject line that says what the notice is.")
+        chk("pass" if (str(case.get("gen_facts") or "").strip()
+                       and "[● the facts]" not in said) else "fail",
+            "The facts are stated.")
+        # The deadline sits between "calls upon you" and the "to", so the phrase
+        # to anchor on is the shorter one and the window has to reach past it.
+        chk("pass" if ("calls upon you" in said
+                       and not _blank_near(said, "calls upon you", 200)) else "fail",
+            "What is required of the other side is stated, in terms that can be complied with.")
+        chk("pass" if (("receipt of this notice" in said or "on or before" in said)
+                       and not re.search(r"within \[●", said)) else "fail",
+            "A period or date is given, running from receipt.")
+        chk("pass" if ("shall be constrained to" in said
+                       and not _blank_near(said, "shall be constrained to")) else "fail",
+            "Consequences of non-compliance are stated.")
+        chk("pass" if "expressly reserved" in said else "fail",
+            "Rights-reserved / without-prejudice line is present.")
+        add_flag("crit", "This is a generic draft. It has no approved wording and no checks of its "
+                         "own beyond the structural ones above — no statutory period is computed, "
+                         "no arithmetic is verified against a template. A lawyer must read the "
+                         "whole notice before it is issued.")
+        # The one way to misuse this tab is to pick it to avoid the questions a
+        # real type would ask.
+        said_all = " ".join(str(case.get(k) or "") for k in
+                            ("gen_title", "gen_subject", "gen_facts", "gen_demand")).lower()
+        for rx, better in ((r"\b(?:cheque|chq)\b.{0,40}\b(?:dishonou?r|bounce|returned unpaid)|"
+                            r"\bsection\s*138\b|\bnegotiable instruments\b", "Section 138 notice"),
+                           (r"\bcease\s+and\s+desist\b|\binfring", "Cease and desist notice"),
+                           (r"\bterminat", "Termination notice"),
+                           (r"\bforce\s+majeure\b", "Force majeure notice"),
+                           (r"\bconsumer\s+(?:forum|commission|notice)\b", "Reply to a consumer notice")):
+            if re.search(rx, said_all):
+                add_flag("crit", f"This reads like a matter the {better} tab is built for. That tab "
+                                 "carries the approved or structured wording and its own checklist; "
+                                 "this one carries neither. Use it unless there is a reason not to.")
+                break
+
     if kind in ("breach", "termination"):
         # clauses named in the facts but not in the citation, and the reverse
         said_cl = set(re.findall(r"clauses?\s+(\d+(?:\.\d+)*(?:\([a-z0-9]+\))?)",
@@ -584,6 +754,78 @@ def validate(kind: str, case: dict, docs=None) -> Report:
         if unexplained:
             add_flag("warn", f"Clause(s) {', '.join(unexplained)} are cited as breached but not explained "
                              "anywhere in the notice. Say what each requires, or drop it from the citation.")
+
+    # ---- 4b. early payment discount --------------------------------------
+    # The discount is a without-prejudice settlement offer sitting next to a
+    # demand. Everything that could make the two contradict each other is a
+    # blocker, because a notice that demands one figure and offers a lower one
+    # on terms that have already lapsed is worse than no offer at all.
+    disc_asked = any(str(case.get(k) or "").strip() for k in
+                     ("discount_pct", "discount_amt", "discount_by"))
+    if disc_asked:
+        base = amt
+        if kind == "termination":
+            base = to_float(case.get("dues"))
+            if base:
+                base -= to_float(case.get("deposit_held")) or 0
+        elif kind == "breach":
+            base = to_float(case.get("dues")) or amt
+        if kind == "s138":
+            r.blockers.append(
+                "An early payment discount has been entered on a Section 138 notice. The statutory "
+                "demand must be for the amount of the dishonoured cheque; demanding or accepting "
+                "less in the notice itself puts the notice at risk. Remove the discount, or make "
+                "the offer in a separate without-prejudice letter.")
+        elif not base:
+            r.blockers.append(
+                "A discount is offered but there is no sum demanded to apply it to. Enter the "
+                "amount first — the discounted figure is calculated from it, never typed.")
+        else:
+            d = SCHEMA.discount(case, base)
+            pct_in = to_float(case.get("discount_pct"))
+            amt_in = to_float(case.get("discount_amt"))
+            if pct_in is not None and amt_in is not None:
+                r.blockers.append(
+                    "Both a percentage and a flat discount are entered. Give one or the other — "
+                    "two discounts on the same sum cannot both be the offer.")
+            elif d is None:
+                r.blockers.append(
+                    "A discount date is given but no discount. Enter the percentage or the flat "
+                    "sum, or clear the date.")
+            elif d.get("bad"):
+                r.blockers.append(
+                    f"The discount of INR {fmt_amount(d['off'])} is not less than the sum demanded "
+                    f"(INR {fmt_amount(base)}). That is a waiver, not a discount.")
+            else:
+                if pct_in is not None and not (0 < pct_in < 100):
+                    r.blockers.append(f"A discount of {pct_in:g}% is not a discount. "
+                                      "Enter a percentage between 0 and 100.")
+                by = parse_date(case.get("discount_by"))
+                if not by:
+                    r.blockers.append(
+                        "The discount has no date by which payment must be received. An open-ended "
+                        "offer never lapses and cannot be withdrawn cleanly.")
+                else:
+                    nd = parse_date(case.get("notice_date"))
+                    if nd and by <= nd:
+                        r.blockers.append(
+                            f"The discount lapses on {fmt_date(by)}, on or before the date of the "
+                            "notice itself. It would be expired when the notice is served.")
+                    # The offer must not outlive the demand period it sits beside.
+                    days = _demand_days(kind, case, draft_text)
+                    if nd and days:
+                        last = nd + timedelta(days=days)
+                        if by > last:
+                            r.blockers.append(
+                                f"The discount runs to {fmt_date(by)}, past the {days}-day period "
+                                f"the notice allows (which ends {fmt_date(last)}). The offer would "
+                                "outlive the demand it is attached to. Bring it forward.")
+                add_flag("info",
+                         f"An early payment discount is offered: INR {fmt_amount(d['net'])} if "
+                         f"received by {fmt_date(d['by']) or '[no date]'}, against the demand of "
+                         f"INR {fmt_amount(base)}. It is worded as a without-prejudice settlement "
+                         "offer and does not reduce the sum demanded. Confirm the offer and the "
+                         "figure are approved before the notice goes out.")
 
     # ---- 5. figures and words must agree ---------------------------------
     # Compared on the number words alone: a missing "Rupees" prefix or "Only"

@@ -14,6 +14,7 @@ from . import compose as C
 from . import skill_loader as SK
 from . import template as T
 from .config import blank
+from . import schema as SCHEMA
 from .schema import label, part_paid, rows
 from .words import fmt_amount, fmt_date, house_words, inr, parse_date, to_float, to_words
 
@@ -335,23 +336,62 @@ def schedule_block(case: dict) -> tuple | None:
                              rows=body))
 
 
+def discount_para(case: dict, demanded, kind: str = "") -> str:
+    """The early payment discount, where CEAT has offered one.
+
+    Every figure here is calculated from the sum demanded, so the discounted
+    amount cannot disagree with the principal on the page — the reason this is
+    not simply another free-text answer. A Section 138 notice never gets one:
+    the statutory demand must be for the cheque amount.
+    """
+    if kind == "s138":
+        return ""
+    d = SCHEMA.discount(case, demanded)
+    if not d or d.get("bad") or d.get("net") is None:
+        return ""                       # validate.py reports why
+    base = to_float(demanded)
+    pct = d["pct"] if d["pct"] is not None else (d["off"] / base * 100.0 if base else 0)
+    pct_txt = (f"{pct:g}%" if abs(pct - round(pct)) < 0.005 else f"{pct:.2f}%")
+    return CL("Early payment discount",
+              "Without prejudice to the Company's rights and remedies, and without in any manner "
+              "admitting or reducing the liability stated above, the Company is willing to accept "
+              "INR {{DISCOUNT_NET_FIGURES}} ({{DISCOUNT_NET_WORDS}}) in full and final settlement of "
+              "the aforesaid sum, being a reduction of INR {{DISCOUNT_OFF_FIGURES}} "
+              "({{DISCOUNT_PERCENT}}), provided the said amount is received by the Company on or "
+              "before {{DISCOUNT_BY_DATE}}. If the said amount is not so received, this offer shall "
+              "stand withdrawn without further intimation and the Company's demand for the full sum "
+              "of INR {{AMOUNT_FIGURES}}, together with interest, shall stand.",
+              dict(DISCOUNT_NET_FIGURES=fmt_amount(d["net"]) + "/-",
+                   DISCOUNT_NET_WORDS=to_words(d["net"]),
+                   DISCOUNT_OFF_FIGURES=fmt_amount(d["off"]) + "/-",
+                   DISCOUNT_PERCENT=pct_txt,
+                   DISCOUNT_BY_DATE=fmt_date(d["by"]) or blank("date the discount lapses"),
+                   AMOUNT_FIGURES=fmt_amount(base) + "/-"))
+
+
 def parties_para(case: dict, goods: str = "the Products") -> str:
     """Who the noticee is — the paragraph the cheque and recovery notices have
     always carried and the contract notices did not, which is how a
     partnership and its partners' joint and several liability disappeared."""
     typ = str(case.get("noticee_type", ""))
     dirs = [d.get("name", "") for d in rows(case, "directors") if d.get("name")]
+    # One director is "is its director", two are "are its directors". The
+    # paragraph used to say "Mr. Bhanwar Singh, are its directors" on a company
+    # with a single director on the record.
+    one = len(dirs) == 1
+    be, dword, pword = ("is", "director", "partner") if one else ("are", "directors", "partners")
     if typ.startswith("Partnership"):
         return (f"That you Noticee No. 1, {V(case,'noticee_name')}, are a partnership firm "
                 f"registered under the Indian Partnership Act, 1932, engaged in the business of "
                 f"purchase and sale of {goods}"
-                + (f"; and {_dir_phrase(dirs)}, are its partners responsible for its management and "
-                   "day-to-day operations, and are jointly and severally liable for the obligations "
-                   "of the said firm." if dirs else "."))
+                + (f"; and {_dir_phrase(dirs)}, {be} its {pword} responsible for its management and "
+                   "day-to-day operations, and "
+                   + ("is liable" if one else "are jointly and severally liable")
+                   + " for the obligations of the said firm." if dirs else "."))
     if typ.startswith("Company"):
         return (f"That you Noticee No. 1, {V(case,'noticee_name')}, are a company registered in "
                 f"India engaged in the business of purchase and sale of {goods}"
-                + (f"; and {_dir_phrase(dirs)}, are its directors responsible for its management "
+                + (f"; and {_dir_phrase(dirs)}, {be} its {dword} responsible for its management "
                    "and day-to-day operations." if dirs else "."))
     return CL("Noticee — individual",
               "That you are the sole proprietor and the person in control and management of the "
@@ -768,6 +808,9 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
             p11 = base11 + " " + (frm if frm.lower().startswith("from") else "from " + frm) \
                   + " until realisation."
         li.append(p11)
+        disc = discount_para(case, case.get("amount"), kind)
+        if disc:
+            li.append(disc)
         li.append(TP("recovery", "Through your deliberate and wilful actions",
                      "Through your deliberate and wilful actions you have deceived and cheated the Company, "
                      "attracting the penal provisions of Sections 316(2) and 318(4) of the Bharatiya Nyaya "
@@ -966,6 +1009,147 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
         body.append(Block("p", text="All our rights, contentions and remedies in law and in equity "
                                     "are hereby expressly reserved."))
 
+    # ------------------------------------------------- cease and desist ---
+    elif kind == "cnd":
+        right_raw = str(case.get("cnd_right") or "")
+        right_short = C.right_short(right_raw)
+        subject = f"Cease and desist — unauthorised use of the Company's {right_short}." \
+            if right_short else "Cease and desist — unauthorised use of the Company's rights."
+        li.append(TP("cnd", "CEAT Limited (\"the Company\") is a Public Limited Company",
+                     f"CEAT Limited (“the Company”) is a Public Limited Company incorporated under the "
+                     f"Companies Act, 1956, having its Registered Office at {ro}, engaged in the "
+                     f"manufacture and sale of Tyres, Tubes and Flaps."))
+        li.append(parties_para(case))
+        held, hnote = C.fit_right(right_raw, case, T.para("cnd", "The Company is the proprietor of"))
+        note(hnote)
+        li.append(held or (T.para("cnd", "The Company is the proprietor of")
+                           or "The Company is the proprietor of and exclusively entitled to "
+                              "{{RIGHT_ASSERTED}}. The said rights are valid, subsisting and "
+                              "enforceable, and the Company has not authorised you to use them in "
+                              "any manner.").replace("{{RIGHT_ASSERTED}}", blank("the right asserted")))
+        acts_tpl = T.para("cnd", "The Company has learnt that")
+        if acts_tpl is None:
+            T.record("cnd", "paragraph beginning “The Company has learnt that”")
+            acts_tpl = ("The Company has learnt that {{OFFENDING_ACTS}}. The said acts came to the "
+                        "Company's notice on {{FIRST_NOTICED_DATE}}.")
+        seen_on = fmt_date(case.get("cnd_first_noticed"))
+        if seen_on:
+            acts_tpl = acts_tpl.replace("{{FIRST_NOTICED_DATE}}", seen_on)
+        else:
+            # No date, so the sentence that exists only to carry it goes. Left in,
+            # it either leaked the slot onto the page or demanded a blank for a
+            # detail the notice can perfectly well do without.
+            acts_tpl = " ".join(s for s in C.sentences(acts_tpl)
+                                if "{{FIRST_NOTICED_DATE}}" not in s)
+        acts, anote = C.fit_acts(case.get("cnd_acts"), case, acts_tpl)
+        note(anote)
+        li.append(acts or acts_tpl.replace("{{OFFENDING_ACTS}}", blank("the offending acts")))
+        li.append(TP("cnd", "The said acts are without the Company's licence",
+                     "The said acts are without the Company's licence, consent or authority and amount "
+                     "to infringement of the Company's rights and to passing off, and are calculated to "
+                     "deceive members of the trade and the public into believing that your goods or "
+                     "business originate from or are approved by the Company. They cause the Company "
+                     "loss of goodwill and reputation which cannot be compensated in money alone."))
+        # A lettered list under a colon, always. "Cease and desist from" takes a
+        # gerund or a noun phrase, so anything typed as an imperative — "remove
+        # all signage" — would otherwise produce "cease and desist from remove
+        # all signage". Under a colon every phrasing reads correctly, and each
+        # act being on its own line is what makes compliance measurable.
+        stop_items = [C.as_cease(x) for x in C.as_items(C.clean(case.get("cnd_stop"))) if x.strip()]
+        stop_items = [x for x in stop_items if x]
+        # The raw template, not a filled one: the slot is replaced by a list, so
+        # TP() would raise on it as an unfilled slot.
+        stop_tpl = T.para("cnd", "You are hereby called upon to immediately CEASE AND DESIST")
+        if stop_tpl is None:
+            T.record("cnd", "paragraph beginning “You are hereby called upon to immediately "
+                            "CEASE AND DESIST”")
+            stop_tpl = ("You are hereby called upon to immediately CEASE AND DESIST from "
+                        "{{WHAT_MUST_STOP}}.")
+        stop_lead = C.strip_end(stop_tpl.split("{{WHAT_MUST_STOP}}")[0]).rstrip(" ,")
+        if not stop_lead:
+            stop_lead = "You are hereby called upon to immediately CEASE AND DESIST from"
+        if stop_items:
+            li.append((stop_lead + " the following acts:",
+                       dict(sub=[_frag(x) for x in C.punctuate(stop_items, last=".")])))
+        else:
+            li.append(stop_lead + " " + blank("what must stop") + ".")
+        und = str(case.get("cnd_undertaking") or "").strip()
+        li.append(TP("cnd", "You are further called upon to confirm in writing",
+                     "You are further called upon to confirm in writing, within {{UNDERTAKING_PERIOD}} "
+                     "from the date of receipt of this notice, that you have ceased the said acts and "
+                     "undertake not to resume them.",
+                     dict(UNDERTAKING_PERIOD=und or blank("period for the undertaking"))))
+        cq, cnote = C.fit_consequences(case.get("consequences"), case,
+                                       T.para("cnd", "Should you fail to comply"))
+        note(cnote)
+        li.append(cq or (T.para("cnd", "Should you fail to comply")
+                         or "Should you fail to comply, the Company shall be constrained to "
+                            "{{CONSEQUENCES}}, entirely at your risk as to the costs and consequences "
+                            "arising therefrom.").replace(
+            "{{CONSEQUENCES}}", "initiate such civil and criminal proceedings as it may be advised, "
+                                "including for a permanent injunction, delivery-up and destruction of "
+                                "infringing material, damages or an account of profits, and costs"))
+        li.append(TP("cnd", "This notice is issued without prejudice",
+                     "This notice is issued without prejudice to the Company's rights and remedies, all "
+                     "of which are expressly reserved, including the right to proceed without further "
+                     "notice."))
+
+    # ----------------------------------------------------------- generic ---
+    elif kind == "generic":
+        title = C.strip_end(C.clean(case.get("gen_title"))) or "Notice"
+        subj = C.strip_end(C.clean(case.get("gen_subject")))
+        subject = (subj or title) + ("" if (subj or title).endswith(".") else ".")
+        li.append(TP("generic", "CEAT Limited (\"the Company\") is a Public Limited Company",
+                     f"CEAT Limited (“the Company”) is a Public Limited Company incorporated under the "
+                     f"Companies Act, 1956, having its Registered Office at {ro}, engaged in the "
+                     f"manufacture and sale of Tyres, Tubes and Flaps."))
+        li.append(parties_para(case))
+        facts_src, swapped = C.house_you(str(case.get("gen_facts") or ""))
+        if swapped:
+            note("The facts referred to the other side in the third person (“the Dealer”, “the "
+                 "Transporter”), so the notice now addresses them as “you”. Check the verbs read "
+                 "correctly.")
+        facts = C.house_self(facts_src)
+        if str(facts).strip():
+            # layout() in the assembly step below turns this into numbered
+            # paragraphs, lettered points or a table with a total as the text
+            # requires — the same treatment every other type's long answers get.
+            li.append(facts)
+        else:
+            li.append(blank("the facts"))
+        # The period goes before the "to", not after it: "calls upon you to,
+        # within 15 days, acknowledge" put a comma between a verb and its
+        # infinitive. "calls upon you, within 15 days, to acknowledge" reads.
+        by = C.strip_end(C.clean(case.get("gen_deadline")))
+        if not by:
+            when = ", within " + blank("the deadline") + " from the date of receipt of this notice,"
+        elif re.match(r"(?i)^\s*(?:on|by|before|upon|immediately)\b", by):
+            when = f", {C.lower_first(by)},"
+        elif re.match(r"(?i)^\s*\d", by) and not re.search(r"(?i)\b(?:day|week|month)", by):
+            when = f", on or before {by},"       # a bare date
+        else:
+            when = f", within {by} from the date of receipt of this notice,"
+        dem_lead = ("In the aforesaid circumstances, the Company hereby calls upon you"
+                    + when + " to")
+        dlead, dsubs = C.fit_called_upon(case.get("gen_demand"), case, "gen_demand", dem_lead)
+        if dsubs:
+            li.append((C.strip_end(dlead) + ":", dict(sub=[_frag(x) for x in dsubs])))
+        else:
+            li.append(dlead or dem_lead + " " + blank("what the Company requires") + ".")
+        # fit_consequences falls back to the breach template, which would say
+        # "Should you fail to cure the breach" in a notice about something else.
+        cq, cnote = C.fit_consequences(
+            case.get("gen_consequences"), case,
+            "Should you fail to comply within the said period, the Company shall be constrained "
+            "to {{CONSEQUENCES}}, entirely at your risk as to the costs and consequences arising "
+            "therefrom.")
+        note(cnote)
+        li.append(cq or "Should you fail to comply within the said period, the Company shall be "
+                  "constrained to " + blank("the consequences")
+                  + ", entirely at your risk as to the costs and consequences arising therefrom.")
+        li.append("This notice is issued without prejudice to the Company's rights and remedies, all "
+                  "of which are expressly reserved.")
+
     # -------------------------------------------- contract notice types ---
     # These four (termination, renewal, force majeure, price) are NON-STANDARD in
     # the skill — no CEAT sample exists yet — so their wording comes from the
@@ -1022,6 +1206,9 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                     f"({to_words(due_)})" + (f", together with interest at {rate_}% per annum until "
                                              "realisation" if rate_ else "") + "."
             li.append(cure)
+            disc = discount_para(case, due_, kind)
+            if disc:
+                li.append(disc)
             p6 = T.para("breach", "Should you fail to cure the breach")
             if p6 is None:
                 T.record("breach", "paragraph beginning “Should you fail to cure the breach”")
@@ -1145,6 +1332,12 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
                         "the Company shall be constrained to initiate appropriate legal proceedings "
                         "against you, at your entire risk as to the costs and consequences arising "
                         "therefrom.")
+            # The discount applies to what is actually payable after the deposit
+            # is appropriated — the figure the paragraph above demands.
+            net_owed = (owed2 - (to_float(case.get("deposit_held")) or 0)) if owed2 else None
+            disc = discount_para(case, net_owed, kind)
+            if disc:
+                li.append(disc)
             li.append(TP("termination", "This termination is without prejudice",
                          "This termination is without prejudice to the Company's rights and remedies, all "
                          "of which are expressly reserved, including for recovery of dues and losses."))
@@ -1391,10 +1584,196 @@ def build(kind: str, case: dict, notes: list | None = None) -> tuple[str, list[B
     if place and kind in ("s138", "recovery"):
         blocks.append(Block("p", text=_final(_jurisdiction(place))))
     blocks.append(Block("sig", text=sig_block(case)))
+    dropped = dedupe_particulars(blocks)
+    for d in dropped:
+        note(d)
     for d in T.drift(kind) + T.drift("clause-library"):
         note(f"Template drift: the skill no longer contains the {d}, so the app's built-in copy was used. "
              "Sync the skill and the app before issuing.")
     return subject, blocks
+
+
+# --------------------------------------------------------------------------
+# One set of particulars, stated once
+#
+# The same invoices used to reach the page twice: spelled out in the facts
+# paragraph, and again in the Schedule immediately below it. On a cheque notice
+# the invoice appeared in the opening recital, in the invoice table, and a third
+# time in the part-discharge paragraph. Nothing was wrong in any one of them,
+# which is why it survived so long — but a reader comparing three statements of
+# the same figure is being invited to find a discrepancy, and CEAT asked for it
+# to stop.
+# --------------------------------------------------------------------------
+# A document reference carries a digit. Without that, "credited" and "Thousand"
+# counted as references and every comparison below silently failed.
+_TBL_REF = re.compile(r"(?=[A-Za-z0-9/._-]*\d)[A-Za-z0-9][A-Za-z0-9/._-]{4,}")
+
+
+def _ref_tokens(s: str) -> set:
+    """Every document reference in a string: 'CEAT/CH/2026/0298', '004521'."""
+    out = set()
+    for m in _TBL_REF.finditer(str(s or "")):
+        tok = m.group(0).rstrip(".,;").upper()
+        if re.fullmatch(r"[\d,./-]+", tok):
+            continue                       # a date, a pincode or a bare figure
+        if len(tok) >= 5:
+            out.add(tok)
+    return out
+
+
+def _refs_in(value) -> set:
+    """Document references inside a table: invoice numbers, cheque numbers."""
+    out = set()
+    if isinstance(value, (list, tuple)):
+        for v in value:
+            out |= _refs_in(v)
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            if k != "head":
+                out |= _refs_in(v)
+    elif value is not None:
+        s = str(value).strip()
+        if s and s.lower() not in ("total", "—", "-"):
+            out |= _ref_tokens(s)
+    return out
+
+
+def _tables_of(blocks: list) -> list[tuple]:
+    """Every table in the document as (where it is, how to reach it, the table,
+    what to call it in a cross-reference)."""
+    found = []
+    for bi, b in enumerate(blocks):
+        if b.kind == "table":
+            lead = blocks[bi - 1].text if bi and blocks[bi - 1].kind == "p" else ""
+            found.append((bi, None, dict(head=b.head, rows=b.rows), _name_of(lead)))
+        elif b.kind == "ol":
+            for ii, it in enumerate(b.items):
+                if isinstance(it, tuple) and isinstance(it[1], dict) and it[1].get("rows"):
+                    found.append((bi, ii, it[1], _name_of(it[0])))
+    return found
+
+
+_INTRO_RX = re.compile(
+    r"(?:particulars|as\s+follows|the\s+following|set\s+out\s+(?:below|in\s+the)|"
+    r"statement\s+of\s+account|schedule|annexure|are\s+as\s+under)", re.I)
+
+
+def _is_table_intro(text: str) -> bool:
+    """A sentence whose whole job is to introduce the table under it.
+
+    A colon promises something, so once the table it introduced has gone the
+    sentence has to go with it. A notice reading "the particulars are set out
+    below:" and then showing nothing is worse than the repeat this was meant to
+    cure. `_INTRO_RX` is kept as a second signal for the clearest cases.
+    """
+    t = str(text or "").strip()
+    return t.endswith(":") or bool(_INTRO_RX.search(t) and t.endswith(("below.", "under.")))
+
+
+def _name_of(lead: str) -> str:
+    """How the notice itself refers to the table, so a cross-reference matches.
+    A notice that calls it the Statement of Account must not be pointed at a
+    "Schedule" that appears nowhere in it."""
+    t = str(lead or "")
+    for word, phrase in (("Schedule", "the Schedule below"),
+                         ("Statement of Account", "the Statement of Account below"),
+                         ("Annexure", "the Annexure below")):
+        if re.search(word, t, re.I):
+            return phrase
+    return "the table below"
+
+
+def dedupe_particulars(blocks: list) -> list[str]:
+    """Drop a table whose particulars an earlier table already carries, and
+    reduce a paragraph that merely re-lists them to a cross-reference.
+
+    Returns a note for anything it changed, so the change is visible in Review
+    notes rather than silent.
+    """
+    notes: list[str] = []
+
+    # --- 1. two tables of the same references -------------------------------
+    # The typed table wins over one derived from prose; otherwise the first.
+    tables = _tables_of(blocks)
+    groups: list[list] = []
+    for entry in tables:
+        refs = _refs_in(entry[2].get("rows"))
+        if not refs:
+            continue
+        for g in groups:
+            if refs <= g[0] or g[0] <= refs:
+                g[0] |= refs
+                g[1].append(entry)
+                break
+        else:
+            groups.append([set(refs), [entry]])
+
+    drop: list[tuple] = []
+    for refs, members in groups:
+        if len(members) < 2:
+            continue
+        typed = [m for m in members if m[2].get("src") != "derived"]
+        keep = (typed or members)[0]
+        for m in members:
+            if m is not keep:
+                drop.append((m[0], m[1]))
+        notes.append("The same particulars were set out in two tables; one was removed. "
+                     f"They are now stated once, in {keep[3]}.")
+
+    for bi, ii in sorted(drop, reverse=True):
+        if ii is None:
+            lead = bi - 1 if bi and blocks[bi - 1].kind == "p" else None
+            blocks.pop(bi)
+            if lead is not None and _is_table_intro(blocks[lead].text):
+                blocks.pop(lead)
+        else:
+            it = blocks[bi].items[ii]
+            if _is_table_intro(it[0]):
+                blocks[bi].items.pop(ii)          # a pointer to a table that has gone
+            else:
+                blocks[bi].items[ii] = C.strip_end(it[0]).rstrip(":") + "."
+
+    # --- 2. prose that re-lists what the table below it shows ---------------
+    where_of: dict = {}
+    for _bi, _ii, tbl, where in _tables_of(blocks):
+        for ref in _refs_in(tbl.get("rows")):
+            where_of.setdefault(ref, where)
+    if not where_of:
+        return notes
+
+    def trim(text: str) -> str:
+        out, changed = [], False
+        for s in C.sentences(str(text)):
+            refs = _ref_tokens(s)
+            hit = {r for r in refs if r in where_of}
+            # Only a sentence that enumerates two or more of the very references
+            # the table lists, and nothing the table does not cover. Anything
+            # looser would be rewriting the notice rather than de-duplicating it.
+            if len(hit) >= 2 and hit == refs:
+                where = where_of[sorted(hit)[0]]
+                out.append(C.cross_reference(s, where))
+                changed = True
+            else:
+                out.append(s)
+        return " ".join(out) if changed else str(text)
+
+    for b in blocks:
+        if b.kind == "p" and b.text:
+            new = trim(b.text)
+            if new != b.text:
+                b.text = new
+                notes.append("A paragraph restated the invoices the Schedule already lists; it now "
+                             "refers to the Schedule instead. The particulars are stated once.")
+        elif b.kind == "ol":
+            for ii, it in enumerate(b.items):
+                if isinstance(it, tuple):
+                    continue                       # the sentence that introduces a table
+                new = trim(it)
+                if new != it:
+                    b.items[ii] = new
+                    notes.append("A paragraph restated the invoices the Schedule already lists; it now "
+                                 "refers to the Schedule instead. The particulars are stated once.")
+    return list(dict.fromkeys(notes))
 
 
 def block_blanks(blocks: list[Block]) -> list[str]:
@@ -1468,6 +1847,130 @@ def to_text(kind: str, case: dict) -> str:
     return "\n".join(out).strip() + "\n"
 
 
+def _empty_body(doc) -> None:
+    """Clear a template's body, keeping its headers, footers, styles and margins.
+
+    CEAT's letterhead template carries the artwork in the page header; whatever
+    placeholder text sits in the body is theirs to show the layout, not part of
+    a notice, and it must not be issued inside one.
+    """
+    body = doc.element.body
+    for child in list(body.iterchildren()):
+        if child.tag.endswith("}sectPr"):          # the page setup must survive
+            continue
+        body.remove(child)
+
+
+def _field(paragraph, instr: str, size=8):
+    """A Word field, so the page number is live rather than typed."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Pt
+    run = paragraph.add_run()
+    run.font.size = Pt(size)
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    txt = OxmlElement("w:instrText")
+    txt.set(qn("xml:space"), "preserve")
+    txt.text = f" {instr} "
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    run._r.append(begin)
+    run._r.append(txt)
+    run._r.append(end)
+    return run
+
+
+def _page_furniture(doc, lh: dict, art: dict, subject: str) -> None:
+    """The letterhead on page 1, a slim running head after it, and a footer.
+
+    Without this the letterhead was three paragraphs at the top of the body:
+    it appeared once, there were no page numbers, and CEAT's own artwork had
+    nowhere to go.
+    """
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt, RGBColor, Cm
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    def line(container, text, *, size=9, bold=False, grey=False, border=False, after=1):
+        p = container.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_after = Pt(after)
+        p.paragraph_format.space_before = Pt(0)
+        for i, part in enumerate(str(text).split("\n")):
+            r = p.add_run(part)
+            r.bold = bold
+            r.font.size = Pt(size)
+            if grey:
+                r.font.color.rgb = RGBColor(0x70, 0x70, 0x70)
+            if i < len(str(text).split("\n")) - 1:
+                r.add_break()
+        if border:
+            pPr = p._p.get_or_add_pPr()
+            bdr = OxmlElement("w:pBdr")
+            bot = OxmlElement("w:bottom")
+            bot.set(qn("w:val"), "single")
+            bot.set(qn("w:sz"), "12")
+            bot.set(qn("w:space"), "4")
+            bot.set(qn("w:color"), "9C7A3C")
+            bdr.append(bot)
+            pPr.append(bdr)
+        return p
+
+    section = doc.sections[0]
+    section.different_first_page_header_footer = True
+
+    # --- page 1: the letterhead -------------------------------------------
+    first = section.first_page_header
+    for p in list(first.paragraphs):             # a fresh document gives one empty one
+        p._p.getparent().remove(p._p)
+    if art.get("logo"):
+        p = first.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_after = Pt(6)
+        try:
+            p.add_run().add_picture(str(art["logo"]),
+                                    width=Cm(float(art.get("logo_width_cm") or 16.0)))
+        except Exception:
+            # Unreadable artwork must never cost the notice its letterhead.
+            line(first, lh["name"], size=15, bold=True, after=2)
+            line(first, lh["address"], size=9)
+            line(first, lh["meta"], size=8, border=True, after=10)
+    else:
+        line(first, lh["name"], size=15, bold=True, after=2)
+        line(first, lh["address"], size=9)
+        line(first, lh["meta"], size=8, border=True, after=10)
+
+    # --- page 2 onwards: a running head, not the whole letterhead ----------
+    cont = section.header
+    for p in list(cont.paragraphs):
+        p._p.getparent().remove(p._p)
+    head = (subject or "").strip().rstrip(".")
+    if len(head) > 90:
+        head = head[:87].rstrip() + "…"
+    line(cont, f"{lh['name']}" + (f" — {head}" if head else ""),
+         size=8, grey=True, border=True, after=10)
+
+    # --- every page: the footer -------------------------------------------
+    for foot in (section.first_page_footer, section.footer):
+        for p in list(foot.paragraphs):
+            p._p.getparent().remove(p._p)
+        if art.get("footer"):
+            line(foot, art["footer"], size=7, grey=True, after=2)
+        p = foot.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_after = Pt(0)
+        r = p.add_run("Page ")
+        r.font.size = Pt(8)
+        r.font.color.rgb = RGBColor(0x70, 0x70, 0x70)
+        _field(p, "PAGE")
+        r = p.add_run(" of ")
+        r.font.size = Pt(8)
+        r.font.color.rgb = RGBColor(0x70, 0x70, 0x70)
+        _field(p, "NUMPAGES")
+
+
 def to_docx(kind: str, case: dict, specimen: bool = False) -> bytes:
     """The notice as a .docx. `specimen=True` (only on explicit request) marks
     the document itself as a fill-in specimen, as the skill's Step 5a requires
@@ -1479,17 +1982,28 @@ def to_docx(kind: str, case: dict, specimen: bool = False) -> bytes:
     from docx.oxml import OxmlElement
 
     lh = SK.letterhead()
+    art = SK.letterhead_assets()
     subject, blocks = build(kind, case)
-    doc = docx.Document()
+
+    if art.get("template"):
+        # CEAT's own Word template: the notice is generated inside it, so the
+        # header, footer, margins and fonts are theirs and not an imitation.
+        doc = docx.Document(str(art["template"]))
+        _empty_body(doc)
+    else:
+        doc = docx.Document()
 
     for s in doc.sections:
-        s.top_margin = s.bottom_margin = Cm(2)
-        s.left_margin = s.right_margin = Cm(2)
+        if not art.get("template"):
+            s.top_margin = s.bottom_margin = Cm(2)
+            s.left_margin = s.right_margin = Cm(2)
 
-    style = doc.styles["Normal"]
-    style.font.name = "Georgia"
-    style.font.size = Pt(11)
-    style.element.rPr.rFonts.set(qn("w:eastAsia"), "Georgia")
+    if not art.get("template"):
+        # Inside CEAT's own template the fonts are theirs; do not overwrite them.
+        style = doc.styles["Normal"]
+        style.font.name = "Georgia"
+        style.font.size = Pt(11)
+        style.element.rPr.rFonts.set(qn("w:eastAsia"), "Georgia")
 
     def _grid(doc_, head, rows_):
         t = doc_.add_table(rows=1, cols=len(head))
@@ -1536,11 +2050,14 @@ def to_docx(kind: str, case: dict, specimen: bool = False) -> bytes:
         for r in sp.runs:
             r.font.color.rgb = RGBColor(0xB0, 0x1E, 0x1E)
 
-    # letterhead
-    para(lh["name"], size=15, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, space_after=2)
-    para(lh["address"], size=9, align=WD_ALIGN_PARAGRAPH.CENTER, space_after=1)
-    p = para(lh["meta"], size=8, align=WD_ALIGN_PARAGRAPH.CENTER, space_after=14)
-    bottom_border(p)
+    # ---- letterhead ------------------------------------------------------
+    # Three sources, in order: CEAT's Word template (already applied above and
+    # carrying its own header), their header artwork, or the text block in
+    # house-style.md. The letterhead sits in the first-page header rather than
+    # in the body, so a two-page notice no longer loses it on page 2 — a notice
+    # that gets filed is read page by page.
+    if not art.get("template"):
+        _page_furniture(doc, lh, art, subject)
 
     for b in blocks:
         if b.kind == "ol":
@@ -1585,7 +2102,13 @@ def filename(kind: str, case: dict, specimen: bool = False) -> str:
     key = {"s138": "Section138_Notice", "recovery": "Recovery_Notice",
            "consumer": "Consumer_Notice_Reply", "breach": "Breach_Notice",
            "termination": "Termination_Notice", "renewal": "Renewal_Notice",
-           "fm": "Force_Majeure_Notice", "price": "Price_Revision_Notice"}.get(kind, "Notice")
+           "fm": "Force_Majeure_Notice", "price": "Price_Revision_Notice",
+           "cnd": "Cease_and_Desist_Notice", "generic": "Notice"}.get(kind, "Notice")
+    if kind == "generic":
+        # The file is named after what the drafter called it, so a folder of
+        # these is not a row of files all called CEAT_Notice_<party>.
+        t = re.sub(r"[^A-Za-z0-9]+", "_", str(case.get("gen_title") or "")).strip("_")[:40]
+        key = t or "Notice"
     party = case.get("client_name") if kind == "consumer" else case.get("noticee_name")
     party = re.sub(r"[^A-Za-z0-9]+", "_", str(party or "Party")).strip("_")[:40] or "Party"
     d = case.get("reply_date") if kind == "consumer" else case.get("notice_date")

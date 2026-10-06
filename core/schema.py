@@ -80,6 +80,13 @@ LABELS = {
     "relief": "Relief sought", "reason": "Reason for the revision",
     "prices": "Revised prices", "quantities": "Affected quantities",
     "schedule": "Schedule of particulars", "pre_orders": "Orders placed before the effective date",
+    "discount_pct": "Early payment discount (%)", "discount_amt": "Early payment discount (INR)",
+    "discount_by": "Discount valid until",
+    "cnd_right": "The right being asserted", "cnd_acts": "The offending acts",
+    "cnd_stop": "What must stop", "cnd_undertaking": "Undertaking period",
+    "cnd_first_noticed": "First noticed on",
+    "gen_subject": "Subject line", "gen_facts": "The facts", "gen_demand": "What the Company requires",
+    "gen_deadline": "Deadline", "gen_consequences": "Consequences", "gen_title": "Notice title",
 }
 
 # What each field MEANS. The model used to receive bare keys such as
@@ -146,6 +153,23 @@ FIELD_HELP = {
     "obligation": "breach: what the clause required the other party to do",
     "breach_facts": "breach: what actually happened — the particulars of the breach",
     "consequences": "breach: what CEAT will do if the breach is not cured",
+    "discount_pct": "an early payment discount offered as a percentage of the amount demanded, "
+                    "digits only. Only if the documents actually say one was offered",
+    "discount_amt": "an early payment discount offered as a flat sum in INR, digits only. Only if "
+                    "the documents actually say one was offered",
+    "discount_by": "the date by which payment must reach the Company for the early payment discount "
+                   "to apply",
+    "cnd_right": "cease and desist: the right CEAT is asserting — the trademark, trade name, "
+                 "copyright, confidential information or contractual right, and how CEAT holds it",
+    "cnd_acts": "cease and desist: what the other side is actually doing that infringes that right",
+    "cnd_stop": "cease and desist: each act that must stop",
+    "cnd_first_noticed": "cease and desist: the date CEAT first became aware of the infringement",
+    "gen_subject": "generic notice: the subject line of the notice",
+    "gen_facts": "generic notice: the facts the notice is based on",
+    "gen_demand": "generic notice: what the Company requires the other side to do",
+    "gen_deadline": "generic notice: the period or date by which it must be done",
+    "gen_consequences": "generic notice: what the Company will do if it is not done",
+    "gen_title": "generic notice: what this kind of notice is called, e.g. 'Notice of Set-off'",
 }
 
 TABLE_COLS = {
@@ -181,6 +205,12 @@ TYPES = {
     "renewal":     dict(name="Renewal / non-renewal notice", blurb="Nearing expiry", tier="ns"),
     "fm":          dict(name="Force majeure notice", blurb="Invoke or respond", tier="ns"),
     "price":       dict(name="Price adjustment notice", blurb="Price revision", tier="ns"),
+    "cnd":         dict(name="Cease and desist notice", blurb="Stop an infringing act", tier="ns"),
+    # Deliberately last, and deliberately loose: a notice that fits none of the
+    # others still belongs on CEAT's letterhead in CEAT's house style rather
+    # than being written from nothing in Word. It carries no type-specific
+    # checklist, so its banner says full legal review and cannot be removed.
+    "generic":     dict(name="Generic draft", blurb="Anything not listed above", tier="free"),
 }
 
 # the only fields that stop a notice being drafted
@@ -203,6 +233,11 @@ CRITICAL = {
     # "prices" is not listed here: a price notice may state a SKU-wise table OR
     # an overall percentage. validate.py requires one of the two.
     "price":       ["noticee_name", "noticee_address", "effective_date"],
+    "cnd":         ["noticee_name", "noticee_address", "cnd_right", "cnd_acts", "cnd_stop"],
+    # The generic type blocks on nothing but the two things no notice can be
+    # addressed without. Everything else it leaves as a visible blank, because
+    # the point of the tab is that the drafter decides what the notice contains.
+    "generic":     ["noticee_name", "noticee_address"],
 }
 
 _PARTY = [
@@ -235,6 +270,17 @@ _PRIOR = Q("prior", "Has a notice already gone to this party on this matter?",
 _JUR = Q("jur", "Where would CEAT file if this isn't resolved?", ["jurisdiction"], kind="text",
          hint="Left blank, the jurisdiction paragraph is left out entirely — never invented.",
          ph="e.g. Mumbai")
+
+# Standard on every notice that demands money. The offer is a settlement made
+# without prejudice, not a reduction of the debt — the wording in the reference
+# files says so, and validate.py refuses a discount that would expire after the
+# demand period or that exceeds the sum demanded.
+_DISCOUNT = Q("discount", "Is an early payment discount being offered, and until when?",
+              ["discount_pct", "discount_amt", "discount_by"],
+              hint="Leave blank for none. Give either a percentage or a flat sum, and the date "
+                   "payment must reach the Company by. The discounted figure is calculated, not "
+                   "typed, so it cannot disagree with the principal.",
+              ph="e.g. 5% if paid by 31.10.2026. Or: INR 25,000 off if paid within 10 days.")
 
 QUESTIONS: dict[str, list[Q]] = {
     "s138": _PARTY + [
@@ -278,7 +324,7 @@ QUESTIONS: dict[str, list[Q]] = {
         Q("tax", "Is the outstanding tax-inclusive? If so, the principal and the GST split.",
           ["principal", "tax"],
           ph="e.g. principal INR 7,13,686.44 and GST INR 1,28,463.56 — leave blank to omit the paragraph"),
-        _JUR, _PRIOR] + _SEND,
+        _DISCOUNT, _JUR, _PRIOR] + _SEND,
 
     "consumer": [
         Q("incoming", "Paste the incoming consumer notice, or attach it.", ["incoming"],
@@ -335,7 +381,7 @@ QUESTIONS: dict[str, list[Q]] = {
                    ("30 (THIRTY) days", "30 days")]),
         Q("conseq", "What happens if they don't?", ["consequences"],
           ph="e.g. terminate the Agreement and initiate proceedings for recovery of dues and losses"),
-        _PRIOR] + _SEND,
+        _DISCOUNT, _PRIOR] + _SEND,
 
     "termination": _PARTY + [
         Q("agr", "Which agreement is being terminated, what does it govern, and under which clause?",
@@ -363,7 +409,7 @@ QUESTIONS: dict[str, list[Q]] = {
           ph="e.g. security deposit of INR 1,00,000 held; termination to take effect on receipt"),
         Q("wind", "What must they do on the way out — dues, stock, signage?", ["wind_down", "dues"],
           ph="e.g. clear dues of INR 3,20,000, return Company property and stock, cease use of CEAT marks"),
-        _PRIOR] + _SEND,
+        _DISCOUNT, _PRIOR] + _SEND,
 
     "renewal": _PARTY + [
         Q("agr", "Which agreement, when does it expire, and which clause governs renewal?",
@@ -411,6 +457,62 @@ QUESTIONS: dict[str, list[Q]] = {
         Q("pre", "What happens to orders already placed before that date?", ["pre_orders"],
           ph="e.g. honoured at existing prices provided despatch is taken within 30 days"),
     ] + _SEND,
+
+    "cnd": _PARTY + [
+        Q("right", "What right is CEAT asserting, and how does CEAT hold it?", ["cnd_right"],
+          attach=True, rows=4,
+          hint="Trademark (with the registration number and class if you have them), trade name, "
+               "copyright, confidential information, or a surviving post-termination clause of an "
+               "agreement. The notice asserts whatever is written here, so be specific.",
+          ph="e.g. the registered trade mark CEAT (No. 123456 in Class 12) and the trade name "
+             "“CEAT”, of which the Company is the registered proprietor"),
+        Q("acts", "What is the other side actually doing, and since when?", ["cnd_acts",
+                                                                            "cnd_first_noticed"],
+          attach=True, rows=4,
+          hint="Particulars, not the abstract complaint. What, where, since when, and how it came "
+               "to CEAT's notice — an investigator's report, a test purchase, a listing, a "
+               "photograph of the signage.",
+          ph="e.g. continuing to display CEAT fascia and signage at Shop 7, MG Road, Nashik after "
+             "termination of the dealership on 12.08.2026, and holding out as an authorised CEAT "
+             "dealer. Noticed on 02.09.2026 during a field visit."),
+        Q("stop", "What exactly must stop?", ["cnd_stop"], rows=4,
+          hint="One act per line. Compliance has to be measurable — the other side should be able "
+               "to read this and know precisely what to take down.",
+          ph="displaying any CEAT fascia, signage or display material\n"
+             "using the CEAT trade marks and trade name in any manner\n"
+             "holding out as an authorised CEAT dealer"),
+        Q("undertaking", "By when must they stop and send a written undertaking?",
+          ["cnd_undertaking"], kind="chips",
+          options=[("7 (SEVEN) days", "7 days"), ("15 (FIFTEEN) days", "15 days"),
+                   ("30 (THIRTY) days", "30 days")]),
+        Q("conseq", "What will CEAT do if they don't?", ["consequences"],
+          ph="e.g. initiate civil and criminal proceedings including for a permanent injunction, "
+             "delivery-up and destruction of infringing material, and damages"),
+        _JUR, _PRIOR] + _SEND,
+
+    "generic": [
+        Q("title", "What is this notice called?", ["gen_title"], kind="text",
+          hint="Used in the subject line. This tab has no approved wording, so the draft is "
+               "always marked for full legal review.",
+          ph="e.g. Notice of Set-off / Notice invoking Arbitration / Notice of Appropriation"),
+    ] + _PARTY + [
+        Q("subject", "What should the subject line say?", ["gen_subject"], kind="text",
+          hint="Leave blank and it is built from the title above.",
+          ph="e.g. Notice of set-off of INR 4,20,000 against your dues under the Dealership "
+             "Agreement dated 04.03.2025"),
+        Q("facts", "What are the facts?", ["gen_facts"], attach=True, rows=8,
+          hint="Paste as much as you have — correspondence, the clause relied on, the figures. "
+               "Long text is laid out as numbered paragraphs, and lines carrying amounts as a "
+               "table with a total.",
+          ph="Paste or type the facts. One point per line or per paragraph."),
+        Q("demand", "What does the Company require them to do?", ["gen_demand"], rows=4,
+          hint="One requirement per line.",
+          ph="e.g. pay INR 4,20,000\nreturn the Company's display material\nconfirm in writing"),
+        Q("deadline", "By when?", ["gen_deadline"], kind="text",
+          ph="e.g. 15 (FIFTEEN) days, or a date"),
+        Q("conseq", "And if they don't?", ["gen_consequences"], rows=3,
+          ph="e.g. initiate appropriate legal proceedings for recovery of the said sum"),
+        _JUR, _PRIOR] + _SEND,
 }
 
 
@@ -470,6 +572,35 @@ def effective(kind: str, case: dict) -> dict:
 
 
 _NO_PART = re.compile(r"\b(?:no|none|nil|not|without any)\b[^.]{0,30}(?:part[- ]?pay|payment)", re.I)
+
+
+def discount(case: dict, demanded) -> dict | None:
+    """The early payment discount, worked out rather than typed.
+
+    Returns the discount, the figure after it and the date it lapses, or None
+    when no discount was offered. The figure is always computed from the sum
+    demanded, so the two can never disagree on the page — which is the whole
+    reason this is not a free-text answer.
+    """
+    base = to_float(demanded)
+    if base is None or base <= 0:
+        return None
+    pct = to_float(case.get("discount_pct"))
+    amt = to_float(case.get("discount_amt"))
+    by = str(case.get("discount_by") or "").strip()
+    if pct is None and amt is None:
+        return None
+    if pct is not None and not (0 < pct < 100):
+        pct = None                     # 0% and 120% are not discounts
+    if amt is not None and amt <= 0:
+        amt = None
+    if pct is None and amt is None:
+        return None
+    off = round(base * pct / 100.0, 2) if pct is not None else amt
+    if off is None or off >= base:
+        # A discount at or above the sum demanded is an error, not an offer.
+        return dict(pct=pct, off=off, net=None, by=by, bad=True)
+    return dict(pct=pct, off=round(off, 2), net=round(base - off, 2), by=by, bad=False)
 
 
 def part_paid(case: dict):

@@ -373,6 +373,130 @@ def fit_breach_facts(raw, case, tpl: str | None) -> tuple[str, str]:
     return base.replace("{{BREACH_FACTS}}", lower_first(t)), ""
 
 
+_RIGHT_WORDS = (
+    (r"\btrade\s*marks?\b|\btrademarks?\b|\bmarks?\b", "trade marks"),
+    (r"\btrade\s*name\b|\bbrand\s*name\b", "trade name"),
+    (r"\bcopyright\b|\bartistic\s+work\b", "copyright"),
+    (r"\bconfidential\b|\btrade\s+secret\b|\bcustomer\s+data\b", "confidential information"),
+    (r"\bget-?up\b|\bpackaging\b|\btrade\s+dress\b", "get-up and packaging"),
+    (r"\bdesign\b", "registered design"),
+    (r"\bpatent\b", "patent"),
+)
+
+
+def right_short(raw) -> str:
+    """A few words naming the right, for the subject line.
+
+    The whole answer can run to a paragraph with registration numbers in it.
+    "Cease and desist — unauthorised use of the Company's registered trade mark
+    CEAT (No. 123456 in Class 12) and the trade name…" is not a subject line.
+    """
+    t = clean(raw)
+    if not t:
+        return ""
+    found = []
+    for rx, name in _RIGHT_WORDS:
+        if re.search(rx, t, re.I) and name not in found:
+            found.append(name)
+    if not found:
+        return "rights"
+    if len(found) == 1:
+        return found[0]
+    return ", ".join(found[:-1]) + " and " + found[-1]
+
+
+_CEASE_LEAD = re.compile(
+    r"^(?:to\s+)?(?:immediately\s+)?(?:cease(?:\s+and\s+desist)?(?:\s+from)?|ceasing(?:\s+to|\s+all)?"
+    r"|desist(?:\s+from)?|stop(?:ping)?|discontinue|refrain(?:\s+from)?|not\s+to)\s+", re.I)
+# Followed by "of", these are nouns, not imperatives: "use of the marks" is
+# already the act, and inflecting it gave "using of the marks".
+_IMPERATIVE = re.compile(
+    r"^(use|display|sell|offer|advertise|market|hold|represent|manufacture|import|export|"
+    r"distribute|supply|reproduce|copy|disclose|retain|print|affix|apply)\b(?!\s+of\b)", re.I)
+
+
+def as_cease(item: str) -> str:
+    """One act, phrased so it reads after "cease and desist from".
+
+    People write these three ways and all three used to break the sentence:
+    "ceasing all use of the marks" gave "cease and desist from ceasing all use";
+    "use of the marks" is already right; "display the signage" gave "cease and
+    desist from display the signage". The lead supplies the verb, so the item
+    must be the act itself, as a gerund.
+    """
+    t = strip_end(clean(item)).strip()
+    if not t:
+        return ""
+    t = _CEASE_LEAD.sub("", t).strip()
+    if not t:
+        return ""
+    m = _IMPERATIVE.match(t)
+    if m:
+        verb = m.group(1).lower()
+        ger = {"use": "using", "hold": "holding", "sell": "selling", "offer": "offering",
+               "apply": "applying", "copy": "copying", "print": "printing",
+               "affix": "affixing", "retain": "retaining", "supply": "supplying",
+               "import": "importing", "export": "exporting", "display": "displaying",
+               "market": "marketing", "disclose": "disclosing", "distribute": "distributing",
+               "advertise": "advertising", "reproduce": "reproducing",
+               "represent": "representing", "manufacture": "manufacturing"}.get(verb)
+        if ger:
+            t = ger + t[m.end(1):]
+    return lower_first(t)
+
+
+def fit_right(raw, case, tpl: str | None) -> tuple[str, str]:
+    """Cease and desist: 'The Company is the proprietor of and exclusively
+    entitled to ___.'"""
+    base = tpl or ("The Company is the proprietor of and exclusively entitled to "
+                   "{{RIGHT_ASSERTED}}. The said rights are valid, subsisting and enforceable, and "
+                   "the Company has not authorised you to use them in any manner.")
+    f = fitted(case, "cnd_right", raw)
+    t = contract_text(strip_end(clean(raw)) if not f else strip_end(f["text"]))
+    if not t:
+        return "", ""
+    # Someone who writes the whole sentence should not get it twice.
+    t = re.sub(r"(?i)^the\s+company\s+is\s+(?:the\s+)?(?:proprietor|owner)\s+of\s+"
+               r"(?:and\s+exclusively\s+entitled\s+to\s+)?", "", t).strip()
+    # "…the trade name CEAT, of which the Company is the registered proprietor"
+    # after a lead that already says the Company is the proprietor said it twice.
+    t = re.sub(r"(?i),?\s*(?:of|in)\s+which\s+the\s+company\s+is\s+(?:the\s+)?"
+               r"(?:registered\s+)?(?:proprietor|owner|holder)\b[^,.]*", "", t).strip(" ,")
+    mode = (f or {}).get("mode") or shape(t)
+    if mode == "sentences":
+        # Whole sentences stand on their own; the assurance that follows is the
+        # part the template contributes.
+        after = base.split("{{RIGHT_ASSERTED}}.", 1)
+        trailer = after[1].strip() if len(after) > 1 else ""
+        return end_stop(cap_first(t)) + (" " + trailer if trailer else ""), ""
+    return base.replace("{{RIGHT_ASSERTED}}", lower_first(t)), ""
+
+
+def fit_acts(raw, case, tpl: str | None) -> tuple[str, str]:
+    """Cease and desist: 'The Company has learnt that ___.'"""
+    base = tpl or "The Company has learnt that {{OFFENDING_ACTS}}."
+    f = fitted(case, "cnd_acts", raw)
+    t = contract_text(strip_end(clean(raw)) if not f else strip_end(f["text"]))
+    if not t:
+        return "", ""
+    t = re.sub(r"(?i)^(?:the\s+company\s+has\s+(?:learnt|learned|come\s+to\s+know)\s+that\s+|"
+               r"it\s+has\s+come\s+to\s+(?:the\s+Company's|our)\s+notice\s+that\s+)", "", t).strip()
+    mode = (f or {}).get("mode") or shape(t)
+    # A gerund is what people actually write here — "continuing to display CEAT
+    # signage", "selling spurious tyres". shape() reads it as a noun phrase, and
+    # "The Company has learnt that there is continuing to display…" is the result.
+    if re.match(r"(?i)^(?:also\s+)?\w+ing\b", t):
+        mode = "verb"
+    if mode == "verb":
+        return base.replace("{{OFFENDING_ACTS}}", "you are " + lower_first(t)), ""
+    if mode == "noun":
+        return base.replace("{{OFFENDING_ACTS}}", "there is " + lower_first(t)), ""
+    if mode in ("clause", "inline", "failure"):
+        return base.replace("{{OFFENDING_ACTS}}", lower_first(t)), ""
+    lead = base.split("{{OFFENDING_ACTS}}", 1)[0].strip()
+    return (lead + " the following: " if lead else "") + end_stop(cap_first(t)), ""
+
+
 def fit_consequences(raw, case, tpl: str | None) -> tuple[str, str]:
     base = tpl or ("Should you fail to cure the breach within the said period, the Company shall be "
                    "constrained to {{CONSEQUENCES}}, at your entire risk as to costs and consequences.")
@@ -748,6 +872,12 @@ def fit_failed_as(raw, case) -> str:
     t = contract_text(strip_end(clean(raw)) if not f else strip_end(f["text"]))
     if not t:
         return ""
+    # Someone who types "You have failed to do so, in that …" should not get it
+    # twice. The lead belongs to the template, not to the answer.
+    t = re.sub(r"(?i)^you\s+have\s+failed\s+to\s+do\s+so\s*[,.:;]?\s*"
+               r"(?:in\s+that|as|because|since)?\s*[,.:;]?\s*", "", t).strip()
+    if not t:
+        return ""
     mode = (f or {}).get("mode") or shape(t)
     if mode in ("clause", "inline"):
         return f"You have failed to do so, as {lower_first(t)}."
@@ -879,6 +1009,56 @@ def _is_item(line: str) -> bool:
     return bool(_AMT_RX.search(line) and (_REF_RX.search(line) or _CODE_RX.match(line)))
 
 
+_REF_CLAUSE = re.compile(
+    r"(?:,\s*)?(?:in\s+respect\s+of|against|namely|viz\.?|comprising|being|i\.e\.?|"
+    r"consisting\s+of|particulars\s+of\s+which\s+are)?\s*"
+    r"(?:invoice|inv|bill|claim|credit note|cn|debit note|dn|cheque|chq)"
+    r"(?:\s*nos?\.?)?[\s:#-]*"
+    r"[A-Za-z0-9][A-Za-z0-9/\-_.]*\d[A-Za-z0-9/\-_.]*"
+    r"(?:\s+dated\s+[\d./-]{6,12})?"
+    r"(?:\s+(?:for|of|amounting\s+to)\s+(?:INR|Rs\.?|₹)\s*[\d,]+(?:\.\d{1,2})?/?-?"
+    r"(?:\s*\((?:Rupees|Rs)[^)]*\))?)?", re.I)
+
+
+def cross_reference(sentence: str, where: str = "the Schedule below") -> str:
+    """One sentence with its enumeration replaced by a pointer to the table.
+
+    "You have failed to do so. The audit found that Invoice A dated D for INR X
+    and Invoice B dated E for INR Y were wrongly credited." becomes "... that
+    the credits set out in the Schedule below were wrongly credited." The
+    sentence keeps its meaning and its verb; only the list of references goes,
+    because the table underneath already carries every one of them.
+    """
+    s = str(sentence or "")
+    hits = list(_REF_CLAUSE.finditer(s))
+    hits = [m for m in hits if _REF_RX.search(m.group(0))]
+    if len(hits) < 2:
+        return s
+    first, last = hits[0], hits[-1]
+    # Any "and"/"," sitting between the first and last reference goes with them.
+    head = s[:first.start()].rstrip(" ,;")
+    tail = s[last.end():].lstrip()
+    tail = re.sub(r"^(?:\s*(?:and|,|;)\s*)+", " ", tail)
+    noun = "the amounts set out in " + where
+    if re.search(r"\b(?:invoices?|bills?)\b", first.group(0), re.I):
+        noun = "the invoices set out in " + where
+    elif re.search(r"\b(?:cheques?|chq)\b", first.group(0), re.I):
+        noun = "the cheques set out in " + where
+    elif re.search(r"\b(?:claims?|credit note|cn)\b", first.group(0), re.I):
+        noun = "the claims set out in " + where
+    if not head:
+        # The pointer now opens the sentence, so it carries the capital the
+        # enumeration used to. Without this the paragraph read "…credit terms.
+        # the invoices set out in the table below remain unpaid."
+        noun = noun[:1].upper() + noun[1:]
+    out = (head + (" " if head else "") + noun + (" " + tail if tail.strip() else "")).strip()
+    out = re.sub(r"\s{2,}", " ", out)
+    out = re.sub(r"\s+([,.;])", r"\1", out)
+    if not out.endswith((".", ":", ";")):
+        out += "."
+    return out
+
+
 def money_sentence_items(text: str) -> list[str]:
     """Three invoices inside one sentence, separated by semicolons or full
     stops, are still a list. "Invoice No. X dated D for INR A…; Invoice No. Y…"
@@ -941,7 +1121,11 @@ def money_table(items: list[str]) -> dict | None:
     if len(rows) < 2:
         return None
     rows.append(["Total", "", "", fmt_amount(total)])
-    return dict(head=["Invoice / reference", "Date", "Due date", "Amount (INR)"], rows=rows)
+    # "derived" marks a table built by reading amounts out of prose, as opposed
+    # to one the user typed into a grid. When both carry the same invoices, the
+    # typed one is the one to keep — it has the columns the user chose to fill.
+    return dict(head=["Invoice / reference", "Date", "Due date", "Amount (INR)"],
+                rows=rows, src="derived")
 
 # --------------------------------------------------------------------------
 # long prose -> paragraphs and points

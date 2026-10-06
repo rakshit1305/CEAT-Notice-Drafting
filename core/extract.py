@@ -14,7 +14,14 @@ from .config import MAX_DOC_CHARS, MAX_SHEET_ROWS
 
 IMAGE_EXT = {"jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"}
 SHEET_EXT = {"xlsx", "xls", "xlsm", "csv"}
-DOC_EXT = {"pdf", "docx", "doc", "txt", "md"}
+MAIL_EXT = {"msg", "eml"}
+DOC_EXT = {"pdf", "docx", "doc", "txt", "md"} | MAIL_EXT
+
+# Every extension the uploader accepts, in one place, so the widget and the
+# reader can never drift apart — an extension the uploader allowed but the
+# reader did not know simply fell through to "decode as UTF-8" and produced a
+# page of mojibake.
+UPLOAD_EXT = sorted(SHEET_EXT | DOC_EXT | IMAGE_EXT - {"gif", "bmp", "tif", "tiff"})
 
 
 @dataclass
@@ -27,6 +34,9 @@ class Doc:
     mime: str = ""
     note: str = ""
     digest: str = ""
+    # Files that travelled inside this one — an Outlook message's attachments.
+    # extract_many() turns each into a Doc of its own.
+    attachments: list[tuple] = field(default_factory=list)
 
     @property
     def dropped_rows(self) -> int:
@@ -102,6 +112,11 @@ def extract(name: str, data: bytes) -> Doc:
         elif ext == "doc":
             d.kind = "error"
             d.note = "legacy .doc cannot be parsed — save as .docx or PDF"
+        elif ext in MAIL_EXT:
+            d.kind = "text"
+            d.text, atts, note = _mail(ext, data)
+            d.attachments = atts
+            d.note = note or d.note
         else:
             d.kind = "text"
             d.text = data.decode("utf-8", errors="replace")
@@ -109,6 +124,38 @@ def extract(name: str, data: bytes) -> Doc:
         d.kind = "error"
         d.note = f"{type(e).__name__}: {e}"
     return d
+
+
+def extract_many(name: str, data: bytes) -> list[Doc]:
+    """The file, plus anything that travelled inside it.
+
+    An Outlook message is dragged in once and gives up both the mail and the
+    ledger attached to it. Before this, someone opened the mail, saved the
+    attachment, saved the body as a Word file, and uploaded two files — which
+    is the preparation time this was meant to remove.
+    """
+    first = extract(name, data)
+    out = [first]
+    stem = re.sub(r"\.(msg|eml)$", "", first.name, flags=re.I)
+    for att_name, blob in (first.attachments or [])[:]:
+        ext = (att_name.rsplit(".", 1)[-1] if "." in att_name else "").lower()
+        if ext not in (SHEET_EXT | DOC_EXT | IMAGE_EXT):
+            # A .p7s signature or an .ics invite is not evidence of anything.
+            continue
+        if not blob:
+            continue
+        child = extract(att_name, blob)
+        child.name = f"{att_name}  (attached to {stem})"
+        out.append(child)
+    return out
+
+
+# --------------------------------------------------------------------------
+def _mail(ext: str, data: bytes) -> tuple[str, list[tuple], str]:
+    from . import email_in
+    if ext == "eml":
+        return email_in.read_eml(data)
+    return email_in.read_msg(data)
 
 
 # --------------------------------------------------------------------------

@@ -200,6 +200,31 @@ def _parse(kind: str, qid: str, raw: str, case: dict) -> dict:
         if rf and qid == "who":
             v["notice_ref"] = rf.group(1).rstrip(".,;")
 
+    if qid == "discount":
+        # "5% if paid by 31.10.2026" / "INR 25,000 off if paid within 10 days"
+        if re.search(r"\b(?:no|none|nil|not\s+offer|no\s+discount)\b", low) and len(t) < 30:
+            return {}
+        pc = re.search(r"(\d{1,2}(?:\.\d{1,2})?)\s*(?:%|per\s*cent|percent)", t, re.I)
+        if pc:
+            v["discount_pct"] = pc.group(1)
+        else:
+            am = find_amounts(t)
+            if am:
+                v["discount_amt"] = str(max(am))
+        ds = find_dates(t)
+        if ds:
+            v["discount_by"] = ds[0]
+        else:
+            # "if paid within 10 days" is a period, not a date; it is resolved
+            # against the notice date so the offer still carries a real date.
+            wd = re.search(r"within\s+(\d{1,3})\s*(day|days|week|weeks)", t, re.I)
+            nd = parse_date(case.get("notice_date"))
+            if wd and nd:
+                import datetime
+                n = int(wd.group(1)) * (7 if wd.group(2).lower().startswith("week") else 1)
+                v["discount_by"] = (nd + datetime.timedelta(days=n)).isoformat()
+        return v
+
     if qid == "deposit" and kind == "termination":
         am = find_amounts(t)
         if am:

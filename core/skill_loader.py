@@ -21,8 +21,18 @@ REF_FILE = {
     "termination": "termination-notice.md",
     "fm":          "force-majeure-notice.md",
     "price":       "price-adjustment-notice.md",
+    "cnd":         "cease-and-desist-notice.md",
+    "generic":     "generic-notice.md",
 }
 APPROVED = {"s138", "recovery", "consumer"}
+
+
+def _plain(t: str) -> str:
+    """Markdown emphasis and inline code off, for text that renders as plain."""
+    t = re.sub(r"\*\*([^*]+)\*\*", r"\1", t)
+    t = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"\1", t)
+    t = re.sub(r"`([^`]+)`", r"\1", t)
+    return t
 
 
 def _read(p: Path) -> str:
@@ -119,6 +129,65 @@ def letterhead() -> dict:
 
 
 @lru_cache(maxsize=1)
+def letterhead_assets() -> dict:
+    """CEAT's own artwork, if they have given us any.
+
+    Three ways to supply a letterhead, in order of preference, all of them
+    drop-in — nothing here needs a code change when the file arrives:
+
+      skill/assets/letterhead.docx   their Word template. Every notice is then
+                                     generated inside it and inherits their
+                                     header, footer, margins and fonts exactly.
+      skill/assets/letterhead.png    the header artwork, placed at the top of
+                                     the first page at its measured width.
+      (nothing)                      the text block in house-style.md, which is
+                                     what has been used until now.
+
+    A footer line, if `house-style.md` carries one, goes at the foot of every
+    page under either of the first two.
+    """
+    out = dict(template=None, logo=None, logo_width_cm=16.0, footer=footer_line())
+    base = SKILL_DIR / "assets"
+    for name in ("letterhead.docx", "ceat-letterhead.docx"):
+        p = base / name
+        if p.is_file():
+            out["template"] = p
+            break
+    for name in ("letterhead.png", "letterhead.jpg", "letterhead.jpeg", "logo.png"):
+        p = base / name
+        if p.is_file():
+            out["logo"] = p
+            break
+    m = re.search(r"(?mi)^letterhead[-_ ]width\s*[:=]\s*([\d.]+)\s*cm", house_style())
+    if m:
+        try:
+            out["logo_width_cm"] = float(m.group(1))
+        except ValueError:
+            pass
+    return out
+
+
+@lru_cache(maxsize=1)
+def footer_line() -> str:
+    """The line CEAT wants at the foot of every page, read from house-style.md.
+
+        ## Page footer
+        ```
+        CEAT Limited · Regd. Office: ... · CIN: ...
+        ```
+    """
+    # The closing fence has to be anchored to its own line. Without the anchor
+    # an *empty* fence matched the opening one and then ran on to the next fence
+    # further down the file, so "no footer" produced half of house-style.md
+    # across the bottom of every page.
+    m = re.search(r"##[ \t]*Page footer[ \t]*\n+```[^\n]*\n(.*?)^```",
+                  house_style(), re.I | re.S | re.M)
+    if not m:
+        return ""
+    return "\n".join(l.strip() for l in m.group(1).splitlines() if l.strip())
+
+
+@lru_cache(maxsize=1)
 def reg_office() -> str:
     flat = re.sub(r"\s+", " ", reference("s138") or skill_md())
     m = re.search(r"Registered Office at (.+?)(?:, serve upon|,? (?:is|having)\b| \(|$)", flat)
@@ -158,7 +227,10 @@ def notice_ref(kind: str) -> NoticeRef:
         m = re.search(rf"##\s+{title}[^\n]*\n(.*?)(?=\n##\s|\Z)", raw, re.S | re.I)
         return m.group(1).strip() if m else ""
 
-    ref.when_to_use = re.sub(r"\s+", " ", section("When to use")).strip()
+    # The reference files are markdown; the hero renders plain text. Emphasis
+    # markers were printing literally, so a reference saying "Do **not** use
+    # this type…" read "Do **not** use this type…" on the page.
+    ref.when_to_use = _plain(re.sub(r"\s+", " ", section("When to use")).strip())
 
     inputs = section("Required inputs")
     ref.required_inputs = [re.sub(r"\s+", " ", l.lstrip("-* ").strip())
@@ -180,8 +252,15 @@ def notice_ref(kind: str) -> NoticeRef:
     return ref
 
 
-def nonstandard_warning() -> str:
+def nonstandard_warning(kind: str = "") -> str:
     m = re.search(r'\*\*"?NON-STANDARD[^"]*"?\*\*', skill_md())
+    if kind == "generic":
+        # The skill's own rule for a type in neither table: a one-off notice is
+        # marked for FULL legal review, not the ordinary non-standard marking.
+        return ("NON-STANDARD — FULL LEGAL REVIEW REQUIRED. This is a free-form draft. There is "
+                "no approved wording for it and no type-specific checklist behind it — only the "
+                "structural checks any notice needs. It is a drafting aid; a lawyer must read "
+                "the whole notice before it is issued.")
     return ("NON-STANDARD — for legal review. No CEAT sample exists for this notice type; "
             "the wording follows standard legal structure in CEAT house style and must be "
             "validated by CEAT's legal team before use.")
