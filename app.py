@@ -17,18 +17,60 @@ import re as _re
 
 import streamlit as st
 
-from core import archive as ARCHIVE
+try:
+    from core import archive as ARCHIVE
+except Exception:                          # an older core/ that cannot save yet
+    ARCHIVE = None
 from core import compose as COMPOSE
 from core import draft as DRAFT
 from core import models as MODELS
 from core import skill_loader as SK
 from core.analyse import analyse
-from core.config import (APP_PASSWORD, AUTO_SAVE, MAX_UPLOAD_MB, SAVE_DIR, SAVE_NOTICES,
-                         llm_ready)
-from core.extract import extract
+from core import config as _CFG
+
+# Read the settings defensively. GitHub uploads happen file by file, and an
+# app.py that is newer than core/config.py used to kill the whole page with an
+# ImportError. Anything missing falls back to the safe value (no saving).
+MAX_UPLOAD_MB = getattr(_CFG, "MAX_UPLOAD_MB", 20)
+SAVE_DIR = getattr(_CFG, "SAVE_DIR", getattr(_CFG, "OUTPUT_DIR", _CFG.ROOT / "drafts"))
+llm_ready = _CFG.llm_ready
+APP_PASSWORD = getattr(_CFG, "APP_PASSWORD", "")
+SAVE_NOTICES = getattr(_CFG, "SAVE_NOTICES", False) and ARCHIVE is not None
+AUTO_SAVE = SAVE_NOTICES and getattr(_CFG, "AUTO_SAVE", False)
+_STALE = [n for n, ok in (("core/config.py", hasattr(_CFG, "SAVE_NOTICES")),) if not ok]
+from core.extract import extract, extract_many        # noqa: F401  (extract kept for reuse)
 from core.schema import (CRITICAL, LABELS, TABLE_COLS, TYPES, is_filled, label, questions)
 from core.validate import missing_critical, missing_optional, validate
-from core.uikit import clean_rows, fit
+try:
+    from core.uikit import clean_rows, fit
+except ImportError:                       # core/uikit.py not uploaded yet
+    _STALE_UIKIT = True
+
+    def fit(name, mod=None):
+        import inspect
+        import streamlit as _st
+        fn = getattr(mod or _st, name, None)
+        try:
+            params = inspect.signature(fn).parameters
+        except Exception:
+            return {"use_container_width": True}
+        if "use_container_width" in params:
+            return {"use_container_width": True}
+        return {"width": "stretch"} if "width" in params else {}
+
+    def clean_rows(rows, cols):
+        if isinstance(rows, dict):
+            rows = [rows]
+        if isinstance(rows, str):
+            rows = []
+        out = []
+        for r in rows or []:
+            if not isinstance(r, dict):
+                r = {cols[0]: r}
+            out.append({c: ("" if r.get(c) is None else str(r.get(c, ""))) for c in cols})
+        return out
+else:
+    _STALE_UIKIT = False
 from core.words import fmt_amount, fmt_date, parse_date
 
 
@@ -132,6 +174,7 @@ section[data-testid="stSidebar"] .stRadio label{font-size:.86rem;}
   border:1px solid var(--edge-2);}
 .tier.ok{background:rgba(127,227,182,.13); color:var(--ok);}
 .tier.ns{background:rgba(246,206,116,.13); color:var(--warn);}
+.tier.free{background:rgba(236,130,130,.13); color:var(--bad);}
 
 /* ---- readiness meter -------------------------------------------------- */
 .meter{min-width:290px; background:var(--glass-2); border:1px solid var(--edge);
@@ -390,6 +433,10 @@ def gate():
 
 
 boot()
+if _STALE or _STALE_UIKIT:
+    behind = _STALE + (["core/uikit.py"] if _STALE_UIKIT else [])
+    st.warning("These files are older than app.py and need uploading: " + ", ".join(behind)
+               + ". The console is running with safe defaults until then (saving off).", icon="⬆️")
 gate()
 apply_restore()
 if st.session_state.get("_toast"):
@@ -458,15 +505,19 @@ with st.sidebar:
 
     approved = [k for k, v in TYPES.items() if v["tier"] == "approved"]
     nonstd = [k for k, v in TYPES.items() if v["tier"] == "ns"]
-    order = approved + nonstd
+    freeform = [k for k, v in TYPES.items() if v["tier"] == "free"]
+    # Free-form last, and marked differently: it has no approved wording and no
+    # checklist of its own, so it should never be the easiest thing to click.
+    order = approved + nonstd + freeform
+    DOT = {"approved": "🟢 ", "ns": "🟡 ", "free": "⚪ "}
     choice = st.radio("Notice type", order, index=order.index(KIND),
-                      format_func=lambda k: ("🟢 " if TYPES[k]["tier"] == "approved" else "🟡 ")
-                      + TYPES[k]["name"],
+                      format_func=lambda k: DOT.get(TYPES[k]["tier"], "🟡 ") + TYPES[k]["name"],
                       key="kind_radio", label_visibility="collapsed")
     if choice != KIND:
         st.session_state.kind = choice
         st.rerun()
-    st.caption("🟢 approved — CEAT samples  ·  🟡 non-standard — no sample yet")
+    st.caption("🟢 approved — CEAT samples  ·  🟡 non-standard — no sample yet  ·  "
+               "⚪ free-form — no approved wording, full legal review")
 
     st.divider()
     S = MODELS.status()
@@ -521,25 +572,31 @@ with st.sidebar:
 def uploader(q):
     up = st.file_uploader(
         "Alternative: attach the supporting document",
-        type=["csv", "xlsx", "xls", "xlsm", "pdf", "docx", "txt",
-              "jpg", "jpeg", "png", "webp"],
+        type=["csv", "xlsx", "xls", "xlsm", "pdf", "docx", "txt", "md",
+              "msg", "eml", "jpg", "jpeg", "png", "webp"],
         accept_multiple_files=True,
         key=f"up_{KIND}_{q.id}",
         label_visibility="collapsed",
-        help="Excel · CSV · PDF · Word · JPG · PNG. Read when you press the analyse button.",
+        help="Outlook mail (.msg / .eml) · Excel · CSV · PDF · Word · JPG · PNG. "
+             "Drag a mail straight out of Outlook — its attachments are read too. "
+             "Read when you press the analyse button.",
     )
     for f in up or []:
         if f.size > MAX_UPLOAD_MB * 1024 * 1024:
             st.error(f"{f.name} is over {MAX_UPLOAD_MB} MB.")
             continue
         data = f.getvalue()
-        doc = st.session_state.parsed.get(_key(data))
-        if doc is None:
-            doc = extract(f.name, data)
-            st.session_state.parsed[_key(data)] = doc
-        if doc.digest not in DOCS:
-            DOCS[doc.digest] = doc
-            touch()
+        docs = st.session_state.parsed.get(_key(data))
+        if docs is None:
+            # A mail arrives as the message plus each of its attachments.
+            docs = extract_many(f.name, data)
+            st.session_state.parsed[_key(data)] = docs
+        if not isinstance(docs, list):                 # a session parsed before this change
+            docs = [docs]
+        for doc in docs:
+            if doc.digest not in DOCS:
+                DOCS[doc.digest] = doc
+                touch()
 
 
 def ask(row):
@@ -655,6 +712,12 @@ def sheet_html(text: str) -> str:
 HERO = st.empty()
 
 
+TIER_CLASS = {"approved": "ok", "ns": "ns", "free": "free"}
+TIER_LABEL = {"approved": "Approved — CEAT sample wording",
+              "ns": "Non-standard — no CEAT sample",
+              "free": "Free-form — no approved wording, full legal review"}
+
+
 def paint_hero(rows, answered, pct, crit_open):
     tier = TYPES[KIND]["tier"]
     ref = SK.notice_ref(KIND)
@@ -663,9 +726,8 @@ def paint_hero(rows, answered, pct, crit_open):
     HERO.markdown(
         f"""<div class="hero">
           <div>
-            <span class="tier {'ok' if tier == 'approved' else 'ns'}">
-              {'Approved — CEAT sample wording' if tier == 'approved'
-                 else 'Non-standard — no CEAT sample'}
+            <span class="tier {TIER_CLASS.get(tier, 'ns')}">
+              {TIER_LABEL.get(tier, 'Non-standard — no CEAT sample')}
             </span>
             <h1>{_h.escape(TYPES[KIND]['name'])}</h1>
             <div class="sub">{_h.escape(ref.when_to_use or TYPES[KIND]['blurb'])}</div>
