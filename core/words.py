@@ -26,6 +26,32 @@ def _u1000(n: int) -> str:
     return out
 
 
+def _indian(n: int) -> str:
+    """Any whole number of rupees, in the Indian system.
+
+    The crore component is unbounded, but it used to be rendered by _u1000,
+    which only reaches 999: 1,000 crore came out as "Ten Hundred Crore" and
+    2,000 crore raised IndexError and killed the notice. Rendering the crore
+    count with this same function instead — "One Thousand Crore" — removes the
+    ceiling, because the count is itself just a number in the same system.
+    """
+    if n <= 0:
+        return ""
+    parts: list[str] = []
+    crore, rest = divmod(n, 10_000_000)
+    lakh, rest = divmod(rest, 100_000)
+    thou, rest = divmod(rest, 1_000)
+    if crore:
+        parts.append(_indian(crore) + " Crore")
+    if lakh:
+        parts.append(_u1000(lakh) + " Lakh")
+    if thou:
+        parts.append(_u1000(thou) + " Thousand")
+    if rest:
+        parts.append(_u1000(rest))
+    return " ".join(p for p in parts if p).strip()
+
+
 def to_words(value) -> str:
     """7,50,400 -> 'Rupees Seven Lakh Fifty Thousand Four Hundred Only'"""
     n = to_float(value)
@@ -43,18 +69,7 @@ def to_words(value) -> str:
     if whole == 0 and paise == 0:
         return ""
     parts: list[str] = []
-    crore, whole = divmod(whole, 10_000_000)
-    lakh, whole = divmod(whole, 100_000)
-    thou, whole = divmod(whole, 1_000)
-    if crore:
-        parts.append(_u1000(crore) + " Crore")
-    if lakh:
-        parts.append(_u1000(lakh) + " Lakh")
-    if thou:
-        parts.append(_u1000(thou) + " Thousand")
-    if whole:
-        parts.append(_u1000(whole))
-    body = " ".join(p for p in parts if p).strip() or "Zero"
+    body = _indian(whole) or "Zero"
     s = "Rupees " + ("Minus " if neg else "") + body
     if paise:
         s += " and Paise " + _u100(paise)
