@@ -9,19 +9,24 @@ So the addresses live here instead: a small editable list, seeded from
 house-style.md so an existing deployment keeps the exact letterhead it has
 today, and extended by the user from the page.
 
-Storage is a JSON file beside app.py. On a hosted deployment that file lives
+Storage is the `offices` table when a database is configured (DATABASE_URL),
+and otherwise a JSON file beside app.py. On a hosted deployment that file lives
 for as long as the container does, which covers a working session but not a
 redeploy — so OFFICES_JSON can point somewhere durable, and a read-only disk
-degrades to session-only rather than raising.
+degrades to session-only rather than raising. The first time the table is
+found empty it is filled from that file, so an existing list carries over.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
+import time
 import unicodedata
 from pathlib import Path
 
+from . import db as DB
 from . import skill_loader as SK
 from .config import ROOT
 
@@ -32,6 +37,9 @@ STORE = Path(os.getenv("OFFICES_JSON") or (ROOT / "offices.json"))
 LAST_SAVE_ERROR: str = ""
 
 FIELDS = ("id", "label", "name", "address", "meta", "reg_office")
+
+_CACHE_SECONDS = 3.0
+_cached: tuple[float, dict] | None = None      # (when read, store) — database mode only
 
 
 def _slug(text: str) -> str:
@@ -82,8 +90,56 @@ def _blank_store() -> dict:
     return {"default_id": first["id"], "offices": [first]}
 
 
+def _load_db() -> dict | None:
+    rows = DB.q("SELECT id, label, name, address, meta, reg_office, is_default"
+                " FROM offices ORDER BY created_at, id")
+    if not rows:
+        return None
+    offices = [_clean(r) for r in rows]
+    default = next((r["id"] for r in rows if r["is_default"]), offices[0]["id"])
+    return {"default_id": default, "offices": offices}
+
+
+def _save_db(store: dict) -> None:
+    offices = [_clean(o) for o in store.get("offices", [])]
+    ids = [o["id"] for o in offices]
+    default_id = store.get("default_id") if store.get("default_id") in ids else (ids[0] if ids else "")
+    with DB.tx():
+        DB.q("UPDATE offices SET is_default = FALSE WHERE is_default")
+        DB.q("DELETE FROM offices WHERE NOT (id = ANY(%s))", (ids,))
+        for o in offices:
+            DB.q("INSERT INTO offices (id, label, name, address, meta, reg_office, is_default)"
+                 " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                 " ON CONFLICT (id) DO UPDATE SET label = EXCLUDED.label, name = EXCLUDED.name,"
+                 " address = EXCLUDED.address, meta = EXCLUDED.meta,"
+                 " reg_office = EXCLUDED.reg_office, is_default = EXCLUDED.is_default,"
+                 " updated_at = now()",
+                 (o["id"], o["label"], o["name"], o["address"], o["meta"], o["reg_office"],
+                  o["id"] == default_id))
+
+
 def load() -> dict:
-    """The whole store. Never raises — a damaged file falls back to the seed."""
+    """The whole store. Never raises — a damaged file, or a database that
+    cannot be reached, falls back to the seed."""
+    global _cached
+    if DB.enabled():
+        # draft.py asks for the office on every paragraph it builds; a few
+        # seconds' memory keeps that to one query per page rather than dozens.
+        if _cached and time.monotonic() - _cached[0] < _CACHE_SECONDS:
+            return copy.deepcopy(_cached[1])
+        try:
+            store = _load_db()
+            if store is None:                 # first run: carry the file's list over
+                store = _load_file()
+                _save_db(store)
+            _cached = (time.monotonic(), copy.deepcopy(store))
+            return store
+        except Exception:
+            return _load_file()
+    return _load_file()
+
+
+def _load_file() -> dict:
     try:
         if STORE.exists():
             data = json.loads(STORE.read_text(encoding="utf-8"))
@@ -100,11 +156,16 @@ def load() -> dict:
 
 
 def save(store: dict) -> bool:
-    """Write the store. False (with LAST_SAVE_ERROR set) if the disk refuses."""
-    global LAST_SAVE_ERROR
+    """Write the store. False (with LAST_SAVE_ERROR set) if the disk — or the
+    database — refuses."""
+    global LAST_SAVE_ERROR, _cached
+    _cached = None
     try:
-        STORE.parent.mkdir(parents=True, exist_ok=True)
-        STORE.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+        if DB.enabled():
+            _save_db(store)
+        else:
+            STORE.parent.mkdir(parents=True, exist_ok=True)
+            STORE.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
         LAST_SAVE_ERROR = ""
         return True
     except Exception as exc:

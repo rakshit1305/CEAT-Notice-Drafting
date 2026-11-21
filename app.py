@@ -8,6 +8,11 @@ State discipline, since this is where Streamlit apps usually come apart:
   * uploads are parsed once and cached by file digest, so a rerun does not
     re-read a 5 MB workbook
   * nothing is drafted until the button is pressed and the checks pass
+
+With DATABASE_URL set, the same session state is backed by Postgres: people
+sign in, each matter is loaded into the session on sign-in and written back at
+the end of every run, and drafted notices go to a shared register. Without it
+nothing below touches a database.
 """
 from __future__ import annotations
 import copy
@@ -19,15 +24,20 @@ import re as _re
 
 import streamlit as st
 
+from core import admin_page as ADMIN
+from core import auth as AUTH
 from core import config as CFG
+from core import db as DB
 from core import draft as DRAFT
 from core import models as MODELS
 from core import offices as OFF
 from core import skill_loader as SK
+from core import store as STORE
 from core.analyse import analyse
 from core.config import MAX_UPLOAD_MB
 from core.extract import extract
 from core.schema import (CRITICAL, LABELS, TABLE_COLS, TYPES, is_filled, label, questions)
+from core.uikit import fit
 from core.validate import missing_critical, missing_optional, validate
 from core.words import fmt_amount, fmt_date
 
@@ -327,6 +337,13 @@ def boot():
     ss.setdefault("qfilter", "Everything")
     ss.setdefault("editver", {})            # "kind" -> int, resets the edit boxes
     ss.setdefault("officever", 0)           # bumps the office picker's key
+    # --- database mode only -------------------------------------------------
+    ss.setdefault("matter_id", {})          # kind -> matters.id once it has a row
+    ss.setdefault("saved_sig", {})          # kind -> fingerprint of what the row holds
+    ss.setdefault("saved_docs", {})         # kind -> digests already in matter_documents
+    ss.setdefault("docbytes", {})           # digest -> (bytes, question id), until stored
+    ss.setdefault("hist_files", {})         # notices.id -> its stored text and .docx
+    ss.setdefault("view", "console")        # console | admin
     for k in TYPES:
         ss.case.setdefault(k, default_case(k))
         ss.docs.setdefault(k, {})
@@ -334,6 +351,27 @@ def boot():
 
 
 boot()
+
+
+def _forget_widgets():
+    """Drop the answers the question widgets are holding for one notice type.
+
+    A keyed widget keeps its own value and writes it back into the case on the
+    next run, so replacing the case underneath it — Clear, Restore — was undone
+    a moment later: the cleared answers came straight back, and a restored
+    notice took the date and choices of whatever was on screen before. The
+    keys cannot be touched in the run that drew the widgets, so whoever
+    replaces a case leaves the type in "_reset_widgets" and this runs first
+    thing on the next run, before any widget exists.
+    """
+    kind = st.session_state.pop("_reset_widgets", None)
+    if kind:
+        for k in [k for k in st.session_state.keys()
+                  if isinstance(k, str) and k.startswith(f"w_{kind}_")]:
+            del st.session_state[k]
+
+
+_forget_widgets()
 
 
 def _gate():
@@ -345,6 +383,8 @@ def _gate():
     Left unset the gate stays open, which is right for local work, so the
     sidebar says plainly that the deployment is unprotected.
     """
+    if DB.enabled():
+        return _sign_in()
     if not CFG.APP_PASSWORD:
         return
     if st.session_state.get("_authed"):
@@ -364,7 +404,230 @@ def _gate():
     st.stop()
 
 
-_gate()
+def _client() -> tuple[str, str]:
+    """(user agent, ip) of the browser, where Streamlit can tell us."""
+    try:
+        ua, ip = st.context.headers.get("User-Agent", ""), st.context.ip_address
+    except Exception:
+        return "", ""
+    return (ua if isinstance(ua, str) else ""), (ip if isinstance(ip, str) else "")
+
+
+def _sign_in():
+    """Database mode: the signed-in account, or the sign-in page and a stop.
+
+    The session is looked up on every run rather than trusted from session
+    state, so an account an admin deactivates, or a password an admin resets,
+    is out on that person's next click.
+    """
+    ss = st.session_state
+    err = DB.init()
+    if err:
+        st.markdown("### CEAT Legal")
+        st.error("**The database cannot be reached, so nobody can be signed in.**\n\n"
+                 f"`{err}`\n\nCheck `DATABASE_URL` in `.env` and that the Postgres server "
+                 "is running. To run without a database, remove `DATABASE_URL`.", icon="🔌")
+        st.stop()
+    AUTH.seed_admin()
+
+    user = AUTH.session_user(ss.get("_token"))
+    if user and not user["must_change_password"]:
+        return user
+
+    _, mid, _ = st.columns([1, 1.15, 1])
+    with mid:
+        st.markdown("### CEAT Legal")
+        st.caption("Notice Drafting Console")
+        if user:                                   # signed in on a temporary password
+            st.info("You are signed in with a temporary password. Choose your own to "
+                    "continue.", icon="🔑")
+            with st.form("first_password"):
+                a = st.text_input("New password", type="password")
+                b = st.text_input("New password again", type="password")
+                if st.form_submit_button("Set my password", type="primary"):
+                    if a != b:
+                        st.error("The two passwords are not the same.")
+                    else:
+                        try:
+                            AUTH.change_password(user["id"], a, keep_token=ss.get("_token"))
+                        except AUTH.AuthError as e:
+                            st.error(str(e))
+                        else:
+                            st.rerun()
+            st.button("Sign out", on_click=_sign_out, key="signout_first")
+        else:
+            with st.form("sign_in"):
+                email = st.text_input("Email")
+                pw = st.text_input("Password", type="password")
+                if st.form_submit_button("Sign in", type="primary"):
+                    try:
+                        who, token = AUTH.login(email, pw, *_client())
+                    except AUTH.AuthError as e:
+                        st.error(str(e))
+                    else:
+                        # A different person in the same browser tab must not
+                        # inherit the last one's answers through widget state.
+                        if ss.get("_loaded_for") not in (None, who["id"]):
+                            for k in list(ss.keys()):
+                                del ss[k]
+                        ss["_token"] = token
+                        st.rerun()
+            st.caption("Accounts are created by an admin — ask one if you need access.")
+    st.stop()
+
+
+def _sign_out():
+    """A button callback: it runs before the page, so wiping the session here
+    cannot collide with a widget that has already been drawn."""
+    ss = st.session_state
+    AUTH.logout(ss.get("_token"))
+    for k in list(ss.keys()):
+        del ss[k]
+
+
+def _go(view: str):
+    st.session_state.view = view
+
+
+def _load_matters(user: dict):
+    """Once per sign-in: this person's open matters, back into the session."""
+    ss = st.session_state
+    if ss.get("_loaded_for") == user["id"]:
+        return
+    had = STORE.open_matters(user["id"])
+    for k in TYPES:
+        m = had.get(k)
+        ss.case[k] = (m["case_json"] if m and m["case_json"] else default_case(k))
+        ss.matter_id[k] = m["id"] if m else None
+        ss.docs[k] = STORE.load_documents(m["id"]) if m else {}
+        ss.saved_docs[k] = set(ss.docs[k])
+        ss.saved_sig[k] = ""
+        # The check report is not kept, so a drafted matter comes back as
+        # "press the button to re-check it" — the same as restoring from History.
+        ss.drafted[k] = False
+    ss.report, ss.history = {}, []
+    ss["_loaded_for"] = user["id"]
+
+
+def _has_content(kind: str, case: dict, docs: dict) -> bool:
+    """Whether there is anything here worth a row: an untouched form is not a matter."""
+    def held(c):
+        return {k: v for k, v in c.items() if k != "_office" and v not in ("", None, [], {})}
+    return bool(docs) or held(case) != held(default_case(kind))
+
+
+def sync_matter(kind: str | None = None):
+    """Write the matter and its attachments back if they have changed. Runs at
+    the end of every page run, and before anything that needs the row to exist."""
+    if not USER:
+        return
+    ss = st.session_state
+    kind = kind or KIND
+    case, docs = ss.case[kind], ss.docs[kind]
+    mid = ss.matter_id.get(kind)
+    if not mid and not _has_content(kind, case, docs):
+        return
+    status = "drafted" if ss.drafted.get(kind) else "open"
+    sig = _hashlib.sha1((DB.jdump(case) + "|" + status).encode()).hexdigest()
+    if not mid or sig != ss.saved_sig.get(kind):
+        mid = STORE.save_matter(mid, kind, case, status, USER["id"])
+        ss.matter_id[kind], ss.saved_sig[kind] = mid, sig
+    saved = ss.saved_docs.setdefault(kind, set())
+    for dg, d in docs.items():
+        if dg not in saved:
+            data, qid = ss.docbytes.pop(dg, (None, None))
+            STORE.save_document(mid, d, data, qid, USER["id"])
+            saved.add(dg)
+    for dg in saved - set(docs):
+        STORE.delete_document(mid, dg)
+    saved &= set(docs)
+    DB.set_actor(USER["id"], USER["email"], mid)
+
+
+def record_notice(kind: str):
+    """Put the notice, as it prints now, in the register. Called when a draft
+    passes its checks and again when it is downloaded, so what was taken away
+    is what is on record; identical text is stored once."""
+    if not USER:
+        return
+    ss = st.session_state
+    R = ss.report.get(kind)
+    try:
+        sync_matter(kind)
+        STORE.save_notice(ss.matter_id.get(kind), kind, ss.case[kind],
+                          R["rep"] if R else None, USER["id"])
+    except Exception as e:
+        ss["_db_error"] = f"{type(e).__name__}: {e}"[:300]
+
+
+def restore_notice(notice_id: int) -> bool:
+    """Pick a notice from the register back up as the working matter of its type."""
+    ss = st.session_state
+    got = STORE.notice_case(notice_id)
+    if not got or got[0] not in TYPES:
+        return False
+    kind, case, mid = got
+    # Reopen the matter it came from if it is this person's; someone else's
+    # notice becomes a new matter of their own rather than a shared row.
+    own = mid if mid and STORE.matter_owner(mid) == USER["id"] else None
+    cur = ss.matter_id.get(kind)
+    if cur and cur != own:
+        STORE.close_matter(cur)                    # parked, not lost
+    ss.kind = kind
+    ss.case[kind] = case
+    ss.matter_id[kind] = own
+    ss.docs[kind] = STORE.load_documents(own)
+    ss.saved_docs[kind] = set(ss.docs[kind])
+    ss.saved_sig[kind] = ""
+    ss.drafted[kind] = False
+    ss.report.pop(kind, None)
+    ss["_reset_widgets"] = kind
+    return True
+
+
+def account_box(view: str):
+    """Who is signed in, and the way out. Drawn in the sidebar of both views."""
+    st.caption(f"Signed in as **{USER['email']}**"
+               + ("  ·  admin" if USER["role"] == "admin" else ""))
+    if USER["role"] == "admin":
+        if view == "admin":
+            st.button("← Back to the console", on_click=_go, args=("console",),
+                      key="nav_console", **fit("button"))
+        else:
+            st.button("Manage users", on_click=_go, args=("admin",),
+                      key="nav_admin", **fit("button"))
+    with st.expander("Change my password"):
+        with st.form("my_password", clear_on_submit=True):
+            cur = st.text_input("Current password", type="password")
+            a = st.text_input("New password", type="password")
+            b = st.text_input("New password again", type="password")
+            if st.form_submit_button("Change it", **fit("form_submit_button")):
+                if a != b:
+                    st.error("The two new passwords are not the same.")
+                else:
+                    try:
+                        AUTH.change_password(USER["id"], a, current=cur,
+                                             keep_token=st.session_state.get("_token"))
+                    except AUTH.AuthError as e:
+                        st.error(str(e))
+                    else:
+                        st.success("Password changed. Other devices have been signed out.")
+    st.button("Sign out", on_click=_sign_out, key="signout", **fit("button"))
+
+
+USER = _gate()                    # the signed-in account in database mode, else None
+if USER:
+    _load_matters(USER)
+    DB.set_actor(USER["id"], USER["email"],
+                 st.session_state.matter_id.get(st.session_state.kind))
+    if st.session_state.view == "admin" and USER["role"] == "admin":
+        with st.sidebar:
+            st.markdown("### CEAT Legal")
+            st.caption("Notice Drafting Console")
+            account_box("admin")
+        ADMIN.render(USER)
+        st.stop()
+
 KIND = st.session_state.kind
 CASE = st.session_state.case[KIND]
 DOCS = st.session_state.docs[KIND]
@@ -387,6 +650,9 @@ def party_of(kind: str, case: dict) -> str:
 
 
 def push_history(kind: str, case: dict, rep) -> None:
+    if USER:                                       # the register is the history
+        record_notice(kind)
+        return
     h = st.session_state.history
     snap = copy.deepcopy(case)
     if h and h[0]["kind"] == kind and h[0]["case"] == snap:
@@ -444,7 +710,10 @@ with st.sidebar:
         st.rerun()
     st.caption("🟢 approved — CEAT samples  ·  🟡 non-standard — no sample yet  ·  "
                "⚪ free-form — full legal review")
-    if not CFG.APP_PASSWORD:
+    if USER:
+        st.divider()
+        account_box("console")
+    elif not CFG.APP_PASSWORD:
         st.warning("**Open to anyone with the link.** Set `APP_PASSWORD` in the app's "
                    "settings to require a password — this console holds dealer names, "
                    "addresses and balances, and spends the configured API key.", icon="🔓")
@@ -531,7 +800,10 @@ with st.sidebar:
                         CASE["_office"] = _added[0]["id"]
                         st.session_state.officever += 1
                         touch()
-                if OFF.LAST_SAVE_ERROR:
+                if OFF.LAST_SAVE_ERROR and USER:
+                    st.warning("Not saved — the office list could not be written to the "
+                               f"database ({OFF.LAST_SAVE_ERROR}).")
+                elif OFF.LAST_SAVE_ERROR:
                     st.warning("Saved for this session only — the office list could not be "
                                f"written to disk ({OFF.LAST_SAVE_ERROR}). Set `OFFICES_JSON` "
                                "to a writable path to keep it across restarts.")
@@ -570,13 +842,24 @@ with st.sidebar:
 
     st.divider()
     if st.button("Clear this case", use_container_width=True, key="clear"):
+        if USER:
+            STORE.close_matter(st.session_state.matter_id.get(KIND))
+            st.session_state.matter_id[KIND] = None
+            st.session_state.saved_docs[KIND] = set()
+            st.session_state.saved_sig[KIND] = ""
         st.session_state.case[KIND] = default_case(KIND)
         st.session_state.docs[KIND] = {}
         st.session_state.drafted[KIND] = False
         st.session_state.report.pop(KIND, None)
+        st.session_state["_reset_widgets"] = KIND
         st.rerun()
-    st.caption("Case details stay in this session only. Clear it when the matter is done — "
-               "notices carry personal data.")
+    if USER:
+        st.caption("This matter is saved as you work and is here when you sign in again. "
+                   "Clearing closes it and starts a new one — notices already drafted stay "
+                   "in History.")
+    else:
+        st.caption("Case details stay in this session only. Clear it when the matter is done — "
+                   "notices carry personal data.")
 
 
 # ------------------------------------------------------------- widgets ----
@@ -601,6 +884,8 @@ def uploader(q):
             st.session_state.parsed[_key(data)] = doc
         if doc.digest not in DOCS:
             DOCS[doc.digest] = doc
+            if USER:                               # the file itself, until it is stored
+                st.session_state.docbytes[doc.digest] = (data, q.id)
             touch()
 
 
@@ -831,6 +1116,7 @@ paint_hero(ROWS, ANSWERED, PCT, CRIT_OPEN)
 # ------------------------------------------------------------ the action ---
 if go:
     with st.spinner("Reading the documents and checking the matter…"):
+        sync_matter()         # so the model calls below are recorded against this matter
         found = analyse(KIND, CASE, list(DOCS.values()))
         applied, evidence = [], {}
         for k, v in (found.values or {}).items():
@@ -867,11 +1153,14 @@ with right:
     n_pass = sum(1 for c in rep.checks if c.state == "pass") if rep else 0
     n_tot = sum(1 for c in rep.checks if c.state != "na") if rep else 0
 
+    n_hist = STORE.count_notices() if USER else len(st.session_state.history)
+    # Taking a notice away puts that exact version in the register.
+    rec = dict(on_click=record_notice, args=(KIND,)) if USER else {}
     tabs = st.tabs(["Draft",
                     f"Review notes{f' ({n_flag})' if n_flag else ''}",
                     f"Checklist{f' ({n_pass}/{n_tot})' if rep else ''}",
                     "All fields",
-                    f"History{f' ({len(st.session_state.history)})' if st.session_state.history else ''}",
+                    f"History{f' ({n_hist})' if n_hist else ''}",
                     "Rules"])
 
     # ---- 1. draft ---------------------------------------------------------
@@ -995,15 +1284,16 @@ with right:
                     fname.replace(".docx", "_SPECIMEN.docx"),
                     "application/vnd.openxmlformats-officedocument."
                     "wordprocessingml.document",
-                    use_container_width=True, key=f"dlspec_{KIND}")
+                    use_container_width=True, key=f"dlspec_{KIND}", **rec)
             else:
                 c1, c2 = st.columns(2)
                 c1.download_button("Download .docx", DRAFT.to_docx(KIND, CASE, edits), fname,
                                    "application/vnd.openxmlformats-officedocument."
                                    "wordprocessingml.document",
-                                   use_container_width=True, key=f"dl_{KIND}")
+                                   use_container_width=True, key=f"dl_{KIND}", **rec)
                 c2.download_button("Download .txt", text, fname.replace(".docx", ".txt"),
-                                   "text/plain", use_container_width=True, key=f"dlt_{KIND}")
+                                   "text/plain", use_container_width=True, key=f"dlt_{KIND}",
+                                   **rec)
             with st.expander("Plain text — copy it straight out"):
                 st.code(text, language=None)
 
@@ -1029,7 +1319,8 @@ with right:
         note = st.text_area("Your own notes on this matter", value=CASE.get("_notes", "") or "",
                             key=nk, height=120,
                             placeholder="Anything you want to remember about this matter. "
-                                        "Kept in this session, never written into the notice.")
+                                        + ("Kept with the matter" if USER else "Kept in this session")
+                                        + ", never written into the notice.")
         if note != (CASE.get("_notes") or ""):
             CASE["_notes"] = note
 
@@ -1089,8 +1380,57 @@ with right:
 
     # ---- 5. history -------------------------------------------------------
     with tabs[4]:
-        H = st.session_state.history
-        if not H:
+        if USER:
+            NOTICES = STORE.list_notices(30)
+            if not NOTICES:
+                st.caption("Every notice drafted is kept here, for everyone who signs in — "
+                           "restore one to pick it back up, or take the stored file.")
+            elif n_hist > len(NOTICES):
+                st.caption(f"The latest {len(NOTICES)} of {n_hist}.")
+            for e in NOTICES:
+                nid = e["id"]
+                with st.container(border=True, key=f"glass_h_{nid}"):
+                    tname = TYPES.get(e["notice_type"], {}).get("name", e["notice_type"])
+                    st.markdown(
+                        f"<div class='hist'><div class='t'>{e['saved_at'].astimezone():%d.%m.%Y  %H:%M}"
+                        f"  ·  {_h.escape(tname)}  ·  {_h.escape(e['party'] or 'unnamed party')}</div>"
+                        f"<div class='s'>{_h.escape((e['subject'] or '')[:150])}</div></div>",
+                        unsafe_allow_html=True)
+                    meta = ["ready to issue" if e["status"] == "ready"
+                            else f"specimen — {e['blanks']} left as [● …]"]
+                    if e["review_notes"]:
+                        meta.append(f"{e['review_notes']} review note(s)")
+                    if e["version"] > 1:
+                        meta.append(f"version {e['version']}")
+                    meta.append(f"by {e['saved_by_email'] or 'a removed account'}")
+                    st.markdown(f"<div class='ev'>{_h.escape(' · '.join(meta))}</div>",
+                                unsafe_allow_html=True)
+                    c1, c2 = st.columns(2)
+                    if c1.button("Restore this case", key=f"rest_{nid}", use_container_width=True):
+                        if restore_notice(nid):
+                            st.toast("Restored — press the button to re-check it.")
+                        st.rerun()
+                    got = st.session_state.hist_files.get(nid)
+                    if got is None:
+                        # Fetched on request: thirty .docx files on every keystroke
+                        # is a megabyte-scale query nobody asked for.
+                        if c2.button("Get the stored files", key=f"hget_{nid}",
+                                     use_container_width=True):
+                            st.session_state.hist_files[nid] = STORE.notice_files(nid) or {}
+                            st.rerun()
+                    elif got:
+                        if got.get("docx"):
+                            c2.download_button(
+                                "Download .docx", got["docx"], got["file_name"],
+                                "application/vnd.openxmlformats-officedocument."
+                                "wordprocessingml.document",
+                                key=f"hdx_{nid}", use_container_width=True)
+                        c2.download_button("Download .txt", got["text"],
+                                           got["file_name"].replace(".docx", ".txt"),
+                                           "text/plain", key=f"hdl_{nid}",
+                                           use_container_width=True)
+        H = [] if USER else st.session_state.history
+        if not H and not USER:
             st.caption("Every notice drafted in this session is kept here — restore one to pick "
                        "it back up, or take the text without leaving the page.")
         for i, e in enumerate(H):
@@ -1113,6 +1453,7 @@ with right:
                     st.session_state.case[e["kind"]] = copy.deepcopy(e["case"])
                     st.session_state.drafted[e["kind"]] = False
                     st.session_state.report.pop(e["kind"], None)
+                    st.session_state["_reset_widgets"] = e["kind"]
                     st.toast("Restored — press the button to re-check it.")
                     st.rerun()
                 c2.download_button("Download .txt",
@@ -1133,3 +1474,16 @@ with right:
                 f"<b>{_h.escape(r.title)}</b><p>{_h.escape(r.body)}</p></div>",
                 unsafe_allow_html=True)
         st.info(SK.review_banner(), icon="⚖️")
+
+# ------------------------------------------------------------- write back --
+# Last thing on the page: whatever this run changed goes to the database. A run
+# cut short by st.rerun() skips this, and the run it starts picks it up.
+if USER:
+    try:
+        sync_matter()
+    except Exception as _e:
+        st.session_state["_db_error"] = f"{type(_e).__name__}: {_e}"[:300]
+    _err = st.session_state.pop("_db_error", None)
+    if _err:
+        st.error("**Your last change could not be saved to the database.** It is still on "
+                 f"this page; it will be tried again on your next edit.\n\n`{_err}`", icon="💾")

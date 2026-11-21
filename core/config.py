@@ -51,7 +51,21 @@ AUTO_SAVE = SAVE_NOTICES and _secret("NOTICE_AUTO_SAVE", "1").strip().lower() \
 
 # A shared password for the whole app. Set it whenever the app is reachable from
 # the internet: Streamlit Community Cloud has no accounts of its own.
+# Only used when no database is configured — with one, people sign in by name.
 APP_PASSWORD = _secret("APP_PASSWORD", "").strip()
+
+# --- database -------------------------------------------------------------
+# postgresql://user:password@host:5432/ceat_notices
+# Set, the app keeps matters, attachments, drafted notices and the office list
+# in Postgres and asks everyone to sign in. Unset, it runs exactly as it did
+# before: in the browser session, with the shared password above.
+DATABASE_URL = _secret("DATABASE_URL", "").strip()
+
+# The first account, created once when the user table is empty. Whoever signs
+# in with it is made to choose a new password before anything else opens.
+ADMIN_EMAIL = _secret("ADMIN_EMAIL", "admin@ceat.com").strip()
+ADMIN_PASSWORD = _secret("ADMIN_PASSWORD", "ChangeMe@123")
+SESSION_HOURS = int(_secret("SESSION_HOURS", "12") or 12)
 
 # --- provider -------------------------------------------------------------
 # Groq is OpenAI-compatible, so the same client speaks to either.

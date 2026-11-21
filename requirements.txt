@@ -10,3 +10,4 @@ python-docx>=1.1        # read .docx, write the notice
 olefile>=0.47           # Outlook .msg is a Compound File; pure Python, no build step
 python-dotenv>=1.0
 httpx>=0.27              # pinned together with openai: they must agree
+psycopg[binary]>=3.2     # Postgres — only used when DATABASE_URL is set

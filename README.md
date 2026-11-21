@@ -19,6 +19,10 @@ streamlit run app.py
 
 Opens on http://localhost:8501.
 
+That is the whole install without a database. To keep matters and notices, and
+give each person their own sign-in, add one line to `.env` — see
+[Database and sign-in](#database-and-sign-in).
+
 ### The key
 
 Get one at <https://console.groq.com/keys>, then in `.env`:
@@ -54,6 +58,75 @@ current directory.
 **`Groq connected` never appears** — `.env` must sit beside `app.py`. On Windows,
 Notepad silently saves it as `.env.txt`; turn on file-name extensions to check. The line
 is `GROQ_API_KEY=gsk_...` with no spaces and no quotes.
+
+## Database and sign-in
+
+Optional. Point the app at a Postgres server and it keeps everything there
+instead of in the browser session:
+
+```
+DATABASE_URL=postgresql://ceat:your_db_password@localhost:5432/ceat_notices
+```
+
+Nothing else to run. On first start the app creates the `ceat_notices` database
+if the server does not have it, creates the tables from `db/schema.sql`, and
+adds the first admin account. It is a separate database from `ceat_compintel`
+on the same server — the two share nothing.
+
+### First sign-in
+
+| | |
+|---|---|
+| Email | `admin@ceat.com` |
+| Password | `ChangeMe@123` |
+
+You are made to choose a new password before anything opens, and the default
+is refused as a new password. The account is created only when there are no
+accounts at all, so it does not come back after you replace or delete it. To
+start with different details, set `ADMIN_EMAIL` and `ADMIN_PASSWORD` in `.env`
+**before** the first start — do this on anything reachable from the internet.
+
+### Adding people — the admin page
+
+There is no self-signup. Sign in as an admin and press **Manage users** in the
+sidebar:
+
+- **Add a person** — their email, a role, and a temporary password (leave it
+  blank and one is generated and shown once). They choose their own at first
+  sign-in.
+- **Change an account** — make someone an admin or a user, untick *Can sign in*
+  to deactivate them, or set a new temporary password. Deactivating or
+  resetting signs that person out on their next click.
+- **Delete this account** — the matters and notices they made stay.
+- **Model usage** — model calls and tokens per person over the last 30 days.
+
+Two roles: **admin** can open this page, **user** can only draft. You cannot
+deactivate, demote or delete yourself, or the only active admin, so the console
+can never be left without one. Anyone can change their own password from the
+sidebar. Five wrong passwords in a row lock that email for fifteen minutes.
+
+### What is kept
+
+| Table | What |
+|---|---|
+| `matters` | Your working case for each notice type, saved as you type and back when you sign in again. *Clear this case* closes it and starts a new one. |
+| `matter_documents` | Every attachment — the file itself and what was read out of it. |
+| `notices` | Every notice that passed its checks, and every version downloaded: the text, the `.docx`, the answers behind it and the review notes. This is the **History** tab, shared by everyone who signs in. Nothing is overwritten; an identical notice is stored once. |
+| `offices` | The issuing offices. An existing `offices.json` is carried over the first time. |
+| `llm_calls` | One row per model call — who, which matter, tokens, time taken. |
+| `app_users`, `app_sessions` | Accounts (passwords as salted PBKDF2 hashes) and sign-ins. |
+
+Signing in lasts for the browser tab: refresh the page and you sign in again,
+and your matter is as you left it. Sign-ins expire after 12 hours
+(`SESSION_HOURS`).
+
+Schema changes go in `db/migrations/002_*.sql` onwards, written so they can run
+twice; the app applies them in name order at every start. If the app's database
+role is not allowed to create databases, run `db/bootstrap.sql` once as a role
+that is.
+
+Without `DATABASE_URL` none of this applies: the app runs in the session, and
+`APP_PASSWORD` sets one shared password for everyone.
 
 ## Three ways in, mix them freely
 
@@ -106,6 +179,11 @@ un-drafts it, so a change always goes back through the checks.
 | `core/freetext.py` | reads fields out of typed answers and out of a whole-matter account |
 | `core/models.py` | asks the provider which models exist and picks one |
 | `core/words.py` | Indian numbering, amounts in words, DD.MM.YYYY |
+| `core/db.py` | the Postgres connection; creates the database and tables on first use |
+| `core/auth.py` | accounts, password hashing, sign-in sessions |
+| `core/store.py` | matters, attachments and the notice register |
+| `core/admin_page.py` | the admin page — who can sign in |
+| `db/schema.sql` | the tables, one comment per table saying what it replaces |
 | `.streamlit/config.toml` | the pinned theme — same look on every machine |
 
 ## The screen
@@ -120,7 +198,8 @@ un-drafts it, so a change always goes back through the checks.
   - *All fields* lists every field the notice can carry and exactly what is
     held against each — a blank is shown as a blank.
   - *History* keeps every notice drafted this session; restore one to pick it
-    back up, or take the text without leaving the page.
+    back up, or take the text without leaving the page. With a database it is
+    the shared register of every notice drafted, with the stored `.docx`.
   - *Rules* is the ten non-negotiables, read live from `SKILL.md`.
   - *Review notes* also has a notepad that never enters the document.
 
@@ -156,6 +235,12 @@ The things that usually break a Streamlit app of this shape, and how they're han
 
 ## Handling real notices
 
-Case data lives in the Streamlit session only — nothing is written to disk unless
-you download it. Run it on your own machine or an internal server; don't put live
-matters on Streamlit Community Cloud. Clear the case when the matter is done.
+Without a database, case data lives in the Streamlit session only — nothing is
+written to disk unless you download it. With one, matters, attachments and
+drafted notices are kept in Postgres until someone removes them: that database
+holds party names, addresses, cheque details and the documents themselves, so
+back it up and restrict access to it the way you would the files.
+
+Run it on your own machine or an internal server; don't put live matters on
+Streamlit Community Cloud. Serve it over HTTPS if it is reachable beyond your
+own machine — sign-in sends the password to the server.
