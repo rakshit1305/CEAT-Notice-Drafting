@@ -12,6 +12,7 @@ ordinary ledgers and invoice text without any model at all.
 from __future__ import annotations
 import json
 import re
+import time
 from dataclasses import dataclass, field
 
 from . import skill_loader as SK
@@ -212,11 +213,21 @@ _GONE = ("decommissioned", "does not exist", "not found", "deprecated",
 
 def _chat(client, role: str, **kw):
     """One chat call, retried once against a freshly discovered model if the
-    pinned ID has been retired since the app started."""
+    pinned ID has been retired since the app started. With a database
+    configured the call is recorded in llm_calls against whoever caused it."""
+    purpose = kw.pop("purpose", None) or {"text": "extract_text", "vision": "extract_vision"}.get(role, role)
+    t0 = time.monotonic()
+    rsp, model = _send(client, role, kw)
+    _record(rsp, model, purpose, t0)
+    return rsp
+
+
+def _send(client, role: str, kw: dict):
+    """(response, the model that answered)."""
     from . import models as MODELS
     model, _ = MODELS.pick(role)
     try:
-        return client.chat.completions.create(model=model, **kw)
+        return client.chat.completions.create(model=model, **kw), model
     except Exception as e:
         msg = str(e).lower()
         # Reasoning models (gpt-5.x, o-series) reject temperature=0. That used to
@@ -224,14 +235,24 @@ def _chat(client, role: str, **kw):
         if "temperature" in msg and ("unsupported" in msg or "not support" in msg
                                      or "only the default" in msg):
             kw.pop("temperature", None)
-            return client.chat.completions.create(model=model, **kw)
+            return client.chat.completions.create(model=model, **kw), model
         if not any(w in msg for w in _GONE):
             raise
         MODELS.available(force=True)
         retry, _ = MODELS.pick(role)
         if retry == model:
             raise
-        return client.chat.completions.create(model=retry, **kw)
+        return client.chat.completions.create(model=retry, **kw), retry
+
+
+def _record(rsp, model: str, purpose: str, t0: float) -> None:
+    from . import db as DB
+    if not DB.enabled():
+        return
+    usage = getattr(rsp, "usage", None)
+    DB.log_llm(model, llm_settings()["name"], purpose,
+               getattr(usage, "prompt_tokens", None), getattr(usage, "completion_tokens", None),
+               int((time.monotonic() - t0) * 1000))
 
 
 def _call_text(kind: str, case: dict, docs: list[Doc]) -> Found:

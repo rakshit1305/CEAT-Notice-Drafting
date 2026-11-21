@@ -679,7 +679,7 @@ def _default_chat(messages) -> str:
     from .analyse import _chat, _client
     client, _ = _client()
     rsp = _chat(client, "text", temperature=0, response_format={"type": "json_object"},
-                messages=messages)
+                messages=messages, purpose="compose")
     return rsp.choices[0].message.content or "{}"
 
 
