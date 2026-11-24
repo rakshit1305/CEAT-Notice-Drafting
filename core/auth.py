@@ -14,13 +14,16 @@ import base64
 import datetime as dt
 import hashlib
 import hmac
+import logging
 import re
 import secrets
 import threading
 import time
 
 from . import db as DB
-from .config import ADMIN_EMAIL, ADMIN_PASSWORD, SESSION_HOURS
+from .config import ADMIN_EMAIL, ADMIN_PASSWORD, DEFAULT_ADMIN_PASSWORD, SESSION_HOURS
+
+log = logging.getLogger(__name__)
 
 ITERATIONS = 600_000
 MIN_PASSWORD = 8
@@ -74,7 +77,7 @@ def temp_password() -> str:
 def _check_new_password(password: str) -> None:
     if len(password or "") < MIN_PASSWORD:
         raise AuthError(f"A password needs at least {MIN_PASSWORD} characters.")
-    if password == ADMIN_PASSWORD:
+    if password in (ADMIN_PASSWORD, DEFAULT_ADMIN_PASSWORD):
         raise AuthError("That is the default password — choose a different one.")
 
 
@@ -96,6 +99,10 @@ def seed_admin() -> bool:
             " SELECT %s, %s, 'admin', TRUE WHERE NOT EXISTS (SELECT 1 FROM app_users)"
             " RETURNING id", (ADMIN_EMAIL, hash_password(ADMIN_PASSWORD))))
     _seed_checked = True
+    if made and ADMIN_PASSWORD == DEFAULT_ADMIN_PASSWORD:
+        log.warning("seeded admin %s with the SHIPPED DEFAULT PASSWORD — it must be changed at "
+                    "first sign-in; set ADMIN_PASSWORD before the first start on a real server",
+                    ADMIN_EMAIL)
     return made
 
 

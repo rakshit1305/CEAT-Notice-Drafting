@@ -145,7 +145,7 @@ CREATE INDEX IF NOT EXISTS notices_type_idx       ON notices(notice_type, saved_
 CREATE TABLE IF NOT EXISTS llm_calls (
     id            BIGSERIAL PRIMARY KEY,
     model         TEXT NOT NULL,
-    provider      TEXT,                          -- Groq | OpenAI-compatible
+    provider      TEXT,                          -- Groq | OpenAI-compatible | azure
     purpose       TEXT NOT NULL,                 -- extract_text | extract_vision | compose
     tokens_in     INTEGER,
     tokens_out    INTEGER,

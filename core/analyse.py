@@ -11,6 +11,7 @@ ordinary ledgers and invoice text without any model at all.
 """
 from __future__ import annotations
 import json
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -222,12 +223,66 @@ def _chat(client, role: str, **kw):
     return rsp
 
 
+def _retryable(exc: Exception) -> bool:
+    """Rate limits and infrastructure blips. A 400 — a bad parameter, a wrong
+    deployment — is permanent; retrying it only hides the real message."""
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None)
+    if status in (408, 409, 429, 500, 502, 503, 504):
+        return True
+    return type(exc).__name__ in ("APITimeoutError", "APIConnectionError", "ReadTimeout",
+                                  "ConnectTimeout", "ConnectError", "ReadError")
+
+
+def _retry_wait(exc: Exception, attempt: int) -> float:
+    """Seconds to wait before trying again: the provider's own Retry-After when
+    it sends one (Azure does, and it knows when the quota window rolls), else
+    exponential backoff with jitter."""
+    from . import config as CFG
+    hdrs = getattr(getattr(exc, "response", None), "headers", None) or {}
+    for key in ("retry-after-ms", "retry-after", "x-ratelimit-reset-requests"):
+        raw = hdrs.get(key)
+        if raw:
+            txt = str(raw).strip().lower()
+            millis = key.endswith("-ms") or txt.endswith("ms")
+            try:
+                val = float(txt.rstrip("ms"))
+                return min(val / 1000 if millis else val, CFG.LLM_RETRY_MAX_SECONDS)
+            except (TypeError, ValueError):
+                pass
+    backoff = CFG.LLM_RETRY_BASE_SECONDS * (2 ** attempt)
+    return min(backoff, CFG.LLM_RETRY_MAX_SECONDS) * (0.7 + random.random() * 0.6)
+
+
+def _create(client, model: str, kw: dict):
+    """One request, waited through rate limits LLM_MAX_RETRIES times."""
+    from . import config as CFG
+    for attempt in range(CFG.LLM_MAX_RETRIES + 1):
+        try:
+            return client.chat.completions.create(model=model, **kw)
+        except Exception as e:
+            if attempt >= CFG.LLM_MAX_RETRIES or not _retryable(e):
+                raise
+            time.sleep(_retry_wait(e, attempt))
+
+
 def _send(client, role: str, kw: dict):
     """(response, the model that answered)."""
     from . import models as MODELS
     model, _ = MODELS.pick(role)
+    if llm_settings().get("azure"):
+        if not model:
+            raise RuntimeError(
+                "LLM_PROVIDER=azure but no deployment is set for this — put the deployment "
+                "name from the Azure portal (not a model id like 'gpt-4.1') in "
+                + ("AZURE_VISION_DEPLOYMENT" if role == "vision" else "AZURE_TEXT_DEPLOYMENT"))
+        # The gpt-5.x family on Azure rejects both of these outright (400):
+        # any temperature but the default, and max_tokens under its old name.
+        kw.pop("temperature", None)
+        if "max_tokens" in kw:
+            kw["max_completion_tokens"] = kw.pop("max_tokens")
     try:
-        return client.chat.completions.create(model=model, **kw), model
+        return _create(client, model, kw), model
     except Exception as e:
         msg = str(e).lower()
         # Reasoning models (gpt-5.x, o-series) reject temperature=0. That used to
@@ -235,24 +290,46 @@ def _send(client, role: str, kw: dict):
         if "temperature" in msg and ("unsupported" in msg or "not support" in msg
                                      or "only the default" in msg):
             kw.pop("temperature", None)
-            return client.chat.completions.create(model=model, **kw), model
+            return _create(client, model, kw), model
         if not any(w in msg for w in _GONE):
             raise
         MODELS.available(force=True)
         retry, _ = MODELS.pick(role)
         if retry == model:
             raise
-        return client.chat.completions.create(model=retry, **kw), retry
+        return _create(client, retry, kw), retry
 
 
 def _record(rsp, model: str, purpose: str, t0: float) -> None:
     from . import db as DB
     if not DB.enabled():
         return
+    s = llm_settings()
     usage = getattr(rsp, "usage", None)
-    DB.log_llm(model, llm_settings()["name"], purpose,
-               getattr(usage, "prompt_tokens", None), getattr(usage, "completion_tokens", None),
-               int((time.monotonic() - t0) * 1000))
+    t_in, t_out = getattr(usage, "prompt_tokens", None), getattr(usage, "completion_tokens", None)
+    try:
+        finish = rsp.choices[0].finish_reason
+    except Exception:
+        finish = None
+    DB.log_llm(model, "azure" if s.get("azure") else s["name"], purpose, t_in, t_out,
+               int((time.monotonic() - t0) * 1000), cost_usd=_cost(model, t_in, t_out),
+               meta={"finish_reason": finish} if finish else None)
+
+
+def _cost(model: str, tokens_in, tokens_out) -> float | None:
+    """Azure bills but tells the API nothing, so work it out from the tokens
+    and LLM_PRICE_TABLE: {"<deployment>": [usd per 1k in, usd per 1k out]}."""
+    from .config import LLM_PRICE_TABLE
+    if not LLM_PRICE_TABLE:
+        return None
+    try:
+        rates = json.loads(LLM_PRICE_TABLE).get(model)
+        if not rates or len(rates) != 2:
+            return None
+        return round((tokens_in or 0) / 1000 * float(rates[0])
+                     + (tokens_out or 0) / 1000 * float(rates[1]), 6)
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 def _call_text(kind: str, case: dict, docs: list[Doc]) -> Found:
