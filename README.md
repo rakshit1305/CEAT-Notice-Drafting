@@ -47,6 +47,41 @@ and scans** through the vision model.
 To use an OpenAI-compatible endpoint instead, set `LLM_PROVIDER=openai` and the
 `OPENAI_*` variables. Nothing else changes — Groq speaks the same protocol.
 
+### Azure OpenAI
+
+`LLM_PROVIDER` chooses the provider per machine — `groq` (default), `openai`,
+or `azure` — so a laptop can stay on Groq while the server runs CEAT's Azure
+resource from the same code. The Azure settings are the ones `ceat-compintel`
+uses, so its block can be pasted in unchanged:
+
+```
+LLM_PROVIDER=azure
+AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com/
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_API_VERSION=2024-10-21
+AZURE_TEXT_DEPLOYMENT=<deployment that reads and writes text>
+AZURE_VISION_DEPLOYMENT=<deployment that reads images>
+```
+
+- **Deployment names, not model ids.** Azure calls whatever you named the
+  deployment in the portal. The app uses the name exactly as set and never
+  substitutes another — a wrong name is a `404 DeploymentNotFound`, shown as it is.
+- **Which deployment.** `AZURE_TEXT_DEPLOYMENT` if set; otherwise
+  `AZURE_TIER2_DEPLOYMENT`, then `AZURE_TIER1_DEPLOYMENT` (the `ceat-compintel`
+  names). `AZURE_VISION_DEPLOYMENT` defaults to the text one.
+- **Either endpoint form.** The bare resource host (uses the API version) or
+  one ending in `/openai/v1` (does not). The app tells them apart from the URL.
+- **Rate limits.** Azure meters tokens per minute per deployment, so a 429 is
+  waited out and retried — as long as Azure says, up to `LLM_MAX_RETRIES` (5)
+  times — instead of dropping to deterministic reading. Timeout 120 s.
+- **Temperature** is not sent on Azure: the gpt-5.x family accepts only the
+  default, so replies vary a little more between runs there.
+- **Cost.** Azure reports tokens, never a price. Set `LLM_PRICE_TABLE` to have
+  `llm_calls.cost_usd` filled in.
+
+The sidebar shows the provider, the deployments in use, and names any setting
+that is still missing.
+
 ### If it won't start
 
 **`No secrets found. Valid paths for a secrets.toml file...`** — this app never reads
@@ -73,6 +108,50 @@ if the server does not have it, creates the tables from `db/schema.sql`, and
 adds the first admin account. It is a separate database from `ceat_compintel`
 on the same server — the two share nothing.
 
+### The same keys as ceat-compintel
+
+Instead of one address, the connection can be given as the pieces
+`ceat-compintel` uses, so the Postgres block of its `.env` carries over with one
+line changed — the database name:
+
+```
+POSTGRES_USER=ceat
+POSTGRES_PASSWORD=your_db_password
+POSTGRES_DB=ceat_notices
+DB_HOST=localhost
+DB_PORT=5433
+```
+
+| Key | What it is |
+|---|---|
+| `POSTGRES_USER`, `POSTGRES_PASSWORD` | The role the app signs in to Postgres with. It can be the one `ceat-compintel` uses. |
+| `POSTGRES_DB` | This app's database. Defaults to `ceat_notices`. |
+| `DB_HOST`, `DB_PORT` | The server. `POSTGRES_HOST` and `POSTGRES_PORT` are read too; the port defaults to 5432. |
+| `DB_SSL_PARAMS` | Optional, for a server that requires TLS — for example `sslmode=verify-full&sslrootcert=/etc/ssl/ceat/ca.crt`. |
+| `DB_WAN_PARAMS` | Optional timeouts and keep-alives for a server reached over the internet. |
+| `DATABASE_URL_LOCAL` | Read as another name for `DATABASE_URL`. |
+
+`DATABASE_URL` wins if it is set as well. Where the server is depends on where
+`ceat-compintel`'s Postgres runs:
+
+- **Its dev stack on this machine** (`docker compose up`): `localhost`, port
+  `5433`, role `ceat`. That role is the superuser there, so the app creates
+  `ceat_notices` by itself.
+- **The shared database server** (`deploy/db-shared`): the server's private
+  address, port `5432`. The `ceat` role cannot create databases there, so the
+  server's administrator runs `db/bootstrap.sql` once, as `postgres`. It creates
+  `ceat_notices` owned by `ceat` and closes it to every other role.
+- **The hardened database server** (`deploy/db-server`): as above, and its
+  `pg_hba.conf` also names each database the app server may reach — add a
+  `hostssl ceat_notices ceat <app server address>/32 scram-sha-256` line beside
+  the `ceat_compintel` one. Use the direct port (`7000`); the pooled port only
+  knows the two `ceat_compintel` databases.
+
+The role and the server can be shared; the database cannot. Pointed at
+`ceat_compintel` (or any database that already has another application's
+tables), the app stops with a message instead of creating its tables there —
+both projects have tables called `app_users` and `llm_calls`.
+
 ### First sign-in
 
 | | |
@@ -85,6 +164,8 @@ is refused as a new password. The account is created only when there are no
 accounts at all, so it does not come back after you replace or delete it. To
 start with different details, set `ADMIN_EMAIL` and `ADMIN_PASSWORD` in `.env`
 **before** the first start — do this on anything reachable from the internet.
+(`SEED_ADMIN_EMAIL`, `SEED_ADMIN_PASSWORD` and `SESSION_TTL_HOURS`, the
+`ceat-compintel` names, are accepted as well.)
 
 ### Adding people — the admin page
 
@@ -121,12 +202,10 @@ and your matter is as you left it. Sign-ins expire after 12 hours
 (`SESSION_HOURS`).
 
 Schema changes go in `db/migrations/002_*.sql` onwards, written so they can run
-twice; the app applies them in name order at every start. If the app's database
-role is not allowed to create databases, run `db/bootstrap.sql` once as a role
-that is.
+twice; the app applies them in name order at every start.
 
-Without `DATABASE_URL` none of this applies: the app runs in the session, and
-`APP_PASSWORD` sets one shared password for everyone.
+With no database configured none of this applies: the app runs in the session,
+and `APP_PASSWORD` sets one shared password for everyone.
 
 ## Three ways in, mix them freely
 

@@ -1,18 +1,38 @@
--- Optional. The app creates its own database on first start (core/db.py), so
--- this is only for a server where the app's role may not CREATE DATABASE, or
--- for setting the database up before the app is deployed.
+-- Creates this app's database on a Postgres server. Run it once, as a role
+-- that may create databases (the superuser on the shared CEAT database server).
 --
--- The console gets a separate logical database (ceat_notices) on the Postgres
--- server that already hosts ceat_compintel — the same arrangement that server
--- uses for ceat_compintel_prefect — so notices, party names and cheque details
--- never share tables, grants or dumps with the competition-intelligence data.
+-- When it is needed: on the shared server (ceat-compintel/deploy/db-shared)
+-- each project signs in with a LOGIN-only role that cannot create databases,
+-- so the app cannot make ceat_notices for itself there. On the ceat-compintel
+-- dev stack the `ceat` role is the superuser and the app creates the database
+-- on first start — this file is then optional.
 --
--- Run connected to any existing database on that server, as a role that may
--- create databases; schema.sql can be applied the same way or left to the app:
---   docker compose exec -T postgres psql -U ceat -d postgres     < db/bootstrap.sql
---   docker compose exec -T postgres psql -U ceat -d ceat_notices < db/schema.sql
+-- Same arrangement as that server's init/00-databases.sql: one database per
+-- project, owned by the project's role, with the CONNECT that Postgres grants
+-- everyone by default taken away. Notices carry party names, cheque numbers
+-- and amounts; the read-only viewer role (ceat_ro) and the other projects'
+-- roles must not be able to open this database at all.
 --
--- Safe to re-run: the database is only created when it is missing.
+--   shared server    docker exec -i ceat-pg psql -U postgres -d postgres < db/bootstrap.sql
+--   dev stack        docker compose exec -T postgres psql -U ceat -d postgres < db/bootstrap.sql
+--
+-- The owner defaults to `ceat` (the role ceat-compintel uses). To give this app
+-- a role of its own, create it first and pass its name:
+--   CREATE ROLE notices WITH LOGIN PASSWORD '...';
+--   psql ... -v owner=notices < db/bootstrap.sql
+--
+-- The tables are not created here: the app applies db/schema.sql itself, as the
+-- owner, the first time it starts. Safe to re-run.
 
-SELECT 'CREATE DATABASE ceat_notices'
+\set ON_ERROR_STOP on
+
+\if :{?owner}
+\else
+    \set owner ceat
+\endif
+
+SELECT format('CREATE DATABASE ceat_notices OWNER %I', :'owner')
 WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'ceat_notices')\gexec
+
+REVOKE CONNECT ON DATABASE ceat_notices FROM PUBLIC;
+SELECT format('GRANT CONNECT ON DATABASE ceat_notices TO %I', :'owner')\gexec

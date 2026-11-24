@@ -822,9 +822,11 @@ with st.sidebar:
     st.divider()
     S = MODELS.status()
     if not S["key"]:
-        st.warning("No model key — deterministic reading only", icon="⚠️")
-        st.caption("Set `GROQ_API_KEY` in `.env` (beside `app.py`) to have documents reasoned "
-                   "over, including cheque photos and scans.")
+        st.warning("No model configured — deterministic reading only", icon="⚠️")
+        st.caption(f"`LLM_PROVIDER` is {S['provider']}. Set "
+                   + ", ".join(f"`{m}`" for m in S["missing"])
+                   + " in `.env` (beside `app.py`) to have documents reasoned over, "
+                     "including cheque photos and scans.")
     elif not S["reachable"]:
         st.error(f"{S['provider']} key set, but the model list could not be fetched", icon="🔌")
         st.caption(f"`{S['error'] or 'no detail'}` — falling back to the configured IDs. "
@@ -832,7 +834,9 @@ with st.sidebar:
         st.caption(f"Running: `{S.get('versions', '')}`")
     else:
         st.success(f"{S['provider']} connected", icon="✅")
-        st.caption(f"text · `{S['text']}`  \nvision · `{S['vision']}` · up to {S['images']} images")
+        _what = "deployment" if S["azure"] else "model"
+        st.caption(f"text {_what} · `{S['text']}`  \nvision {_what} · `{S['vision']}` · "
+                   f"up to {S['images']} images")
         if "fell back" in S["text_why"] or "fell back" in S["vision_why"]:
             st.caption("⚠️ A model named in `.env` is not available on this account; "
                        "the best available one is being used instead.")
