@@ -138,9 +138,18 @@ DB_PORT=5433
   `5433`, role `ceat`. That role is the superuser there, so the app creates
   `ceat_notices` by itself.
 - **The shared database server** (`deploy/db-shared`): the server's private
-  address, port `5432`. The `ceat` role cannot create databases there, so the
-  server's administrator runs `db/bootstrap.sql` once, as `postgres`. It creates
-  `ceat_notices` owned by `ceat` and closes it to every other role.
+  address, port `5432`. Roles there cannot create databases, and new roles and
+  databases do not appear by themselves, so the server's administrator runs
+  `db/bootstrap.sql` once, as `postgres`. It creates the database, owned by the
+  app's role, and closes it to every other role. By default that is
+  `ceat_notices` owned by `ceat`; for a role and database of this app's own,
+  pass the names from `.env` and the role is created too:
+
+  ```
+  read -s APP_DB_PASSWORD && export APP_DB_PASSWORD      # the POSTGRES_PASSWORD
+  docker exec -i -e APP_DB_PASSWORD ceat-pg \
+      psql -U postgres -d postgres -v db=legal -v owner=legal < db/bootstrap.sql
+  ```
 - **The hardened database server** (`deploy/db-server`): as above, and its
   `pg_hba.conf` also names each database the app server may reach — add a
   `hostssl ceat_notices ceat <app server address>/32 scram-sha-256` line beside

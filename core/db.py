@@ -79,8 +79,8 @@ def _create_database() -> None:
         # database has to be made once by whoever administers it.
         raise RuntimeError(
             f"The database {name} does not exist and the role {info.get('user')} may not create "
-            "it. Ask whoever runs the Postgres server to run db/bootstrap.sql once, then "
-            "start the app again.") from None
+            "it. Ask whoever runs the Postgres server to run db/bootstrap.sql once "
+            f"(with -v db={name} -v owner={info.get('user')}), then start the app again.") from None
 
 
 def _foreign_table(c) -> str:
